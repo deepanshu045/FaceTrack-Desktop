@@ -51,6 +51,7 @@ class FaceAttendanceApp(tk.Tk):
         self.sound_enabled = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Ready. Start scanning when the camera is available.")
         self.person = tk.StringVar(value="No face detected")
+        self.lecture = tk.StringVar(value="No active lecture")
         self.access_code = tk.StringVar()
         self.selected_college_slug = ""
         self._build_college_access_page()
@@ -138,25 +139,25 @@ class FaceAttendanceApp(tk.Tk):
         info = tk.Frame(body, bg="#17232e", width=280, padx=18, pady=20)
         info.pack(side="right", fill="y", padx=(16, 0))
         info.pack_propagate(False)
-        tk.Label(info, text="LIVE ATTENDANCE", font=("Segoe UI", 12, "bold"), bg="#17232e", fg="#60a5fa").pack(anchor="w")
-        tk.Label(info, textvariable=self.person, justify="left", wraplength=240, font=("Segoe UI", 16, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(22, 20))
+        tk.Label(info, text="LIVE LECTURE", font=("Segoe UI", 12, "bold"), bg="#17232e", fg="#60a5fa").pack(anchor="w")
+        tk.Label(info, textvariable=self.lecture, justify="left", wraplength=240, font=("Segoe UI", 14, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(10, 22))
+        tk.Label(info, text="STUDENT", font=("Segoe UI", 10, "bold"), bg="#17232e", fg="#94a3b8").pack(anchor="w")
+        tk.Label(info, textvariable=self.person, justify="left", wraplength=240, font=("Segoe UI", 15, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(6, 20))
         tk.Label(info, text="Rules", font=("Segoe UI", 11, "bold"), bg="#17232e", fg="white").pack(anchor="w")
-        tk.Label(info, text="• One face only\n• Match must be a registered student\n• Attendance is recorded once per day", justify="left", bg="#17232e", fg="#cbd5e1").pack(anchor="w", pady=(8, 22))
+        tk.Label(info, text="• One face only\n• Match must be a registered student\n• One attendance record per lecture", justify="left", bg="#17232e", fg="#cbd5e1").pack(anchor="w", pady=(8, 22))
         tk.Label(self, textvariable=self.status, anchor="w", padx=16, pady=10, bg="#0b1118", fg="#cbd5e1").pack(fill="x")
 
     def start(self) -> None:
         self.stop()
         try:
-            # Refresh the matched college's data in case its dashboard or
-            # student records changed after the access screen was opened.
             self._load_college_data()
             self._apply_recognition_settings(self.settings)
+            self.lecture.set("Waiting for a recognized student…")
             self.camera = cv2.VideoCapture(self.camera_index.get(), cv2.CAP_DSHOW)
             width, height = RESOLUTIONS[self.resolution.get()]
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.camera.set(cv2.CAP_PROP_FPS, int(self.target_fps.get()))
-            # Avoid displaying old frames when recognition is slower than the camera.
             self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not self.camera.isOpened():
                 raise RuntimeError("Camera could not be opened. Check the selected camera number.")
@@ -292,8 +293,20 @@ class FaceAttendanceApp(tk.Tk):
         if student.id != self.last_match_id or now - self.last_match_at > 5:
             self.last_match_id, self.last_match_at = student.id, now
             try:
-                created = self.repository.mark_present(student.id) if self.repository else False
-                result = "Attendance marked" if created else "Attendance already marked today"
+                payload = self.repository.mark_present(student.id) if self.repository else {}
+                lecture = payload.get("lecture") or {}
+                subject = lecture.get("subject")
+                start_time = lecture.get("start_time", "")[:5]
+                end_time = lecture.get("end_time", "")[:5]
+                if subject:
+                    self.lecture.set(f"{subject}\n{start_time} – {end_time}")
+
+                if payload.get("already_marked"):
+                    result = "Attendance already marked for this lecture"
+                elif payload.get("attendance_marked"):
+                    result = "Attendance marked for this lecture"
+                else:
+                    result = payload.get("message", "Attendance status unavailable")
                 self.status.set(f"{result}: {student.name}")
                 if self.sound_enabled.get():
                     self._play_recognition_sound()
