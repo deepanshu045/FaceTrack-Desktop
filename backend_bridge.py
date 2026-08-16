@@ -117,10 +117,9 @@ class AttendanceRepository:
     def students_with_faces(self) -> list[RegisteredStudent]:
         return list(self._students)
 
-    def mark_present(self, student_id: int) -> bool:
-        payload = _request_json(
+    def mark_present(self, student_id: int) -> dict:
+        return _request_json(
             "post",
             f"/public/college/{quote(self._college_slug, safe='')}/mark-attendance",
             json={"student_id": student_id},
         )
-        return bool(payload.get("attendance_marked", False))
