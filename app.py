@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
+import ctypes
+import sys
 import time
+
+# Make Tkinter render at native Windows DPI instead of bitmap-scaling the app.
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except (AttributeError, OSError):
+            pass
+
 import tkinter as tk
 import winsound
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -29,7 +42,6 @@ class FaceAttendanceApp(tk.Tk):
         self.geometry("1240x820")
         self.minsize(1080, 700)
         self.configure(bg="#070d18")
-
         self.camera: cv2.VideoCapture | None = None
         self.capture_thread: Thread | None = None
         self.capture_stop = Event()
@@ -46,7 +58,6 @@ class FaceAttendanceApp(tk.Tk):
         self.last_match_at = 0.0
         self.running = False
         self.liveness = LivenessGuard()
-
         self.camera_index = tk.IntVar(value=0)
         self.resolution = tk.StringVar(value="480p")
         self.target_fps = tk.StringVar(value="30")
@@ -57,7 +68,6 @@ class FaceAttendanceApp(tk.Tk):
         self.liveness_status = tk.StringVar(value="Liveness waiting")
         self.access_code = tk.StringVar()
         self.selected_college_slug = ""
-
         self._configure_styles()
         self._build_college_access_page()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -131,15 +141,15 @@ class FaceAttendanceApp(tk.Tk):
         self._label(header, "LIVE ATTENDANCE", 9, "bold", "#70a8ff", "#0b1321").pack(side="left", padx=(10, 0))
         self.header_status = self._label(header, "● Scanner offline", 9, "bold", "#8c9bb0", "#0b1321")
         self.header_status.pack(side="right")
-
         stats = tk.Frame(self, bg="#070d18", padx=20, pady=16)
         stats.pack(fill="x")
         self._stat_card(stats, "SCANNER STATUS", "Ready to start", "◉", "scanner_stat")
         self._stat_card(stats, "TODAY PRESENT", "Attendance from this scanner", "✓", "present_stat")
         self._stat_card(stats, "FACE PROFILES READY", str(len(self.students)), "♙", "profiles_stat")
 
-        content = tk.Frame(self, bg="#070d18", padx=20, pady=(0, 20))
-        content.pack(fill="both", expand=True)
+        # pady tuple belongs to pack(), not tk.Frame().
+        content = tk.Frame(self, bg="#070d18", padx=20, pady=0)
+        content.pack(fill="both", expand=True, pady=(0, 20))
 
         left = self._card(content, bg="#172234", padx=22, pady=18)
         left.pack(side="left", fill="both", expand=True)
@@ -151,12 +161,10 @@ class FaceAttendanceApp(tk.Tk):
         self._label(title, "Keep exactly one registered face inside the guide.", 9, fg="#8ea0b9").pack(anchor="w", pady=(3, 0))
         self.start_button = ttk.Button(title_row, text="▣  Start Camera", style="Blue.TButton", command=self.start)
         self.start_button.pack(side="right")
-
         camera_shell = tk.Frame(left, bg="#03070d", highlightbackground="#1d2b40", highlightthickness=1)
         camera_shell.pack(fill="both", expand=True, pady=(18, 14))
         self.video_label = tk.Label(camera_shell, text="Camera is stopped", bg="#03070d", fg="#73849d", font=("Segoe UI", 13), anchor="center")
         self.video_label.pack(fill="both", expand=True)
-
         control = tk.Frame(left, bg="#172234")
         control.pack(fill="x")
         self._label(control, "QUALITY", 8, "bold", "#7589a5").pack(side="left")
@@ -173,13 +181,11 @@ class FaceAttendanceApp(tk.Tk):
         self._label(right, "Recognition only succeeds after liveness.", 9, fg="#8ea0b9").pack(anchor="w", pady=(3, 18))
         self._verification_pill(right, "LIVENESS", self.liveness_status)
         self._verification_pill(right, "IDENTITY", self.person)
-
         rules = self._card(right, bg="#0e1727", padx=14, pady=14)
         rules.pack(fill="x", pady=(18, 14))
         self._label(rules, "SECURITY CHECKS", 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
         for text in ("One face only", "AI anti-spoofing required", "Blink challenge required", "Registered student required", "Attendance once per day"):
             self._label(rules, "•  " + text, 9, fg="#c7d4e5", bg="#0e1727").pack(anchor="w", pady=3)
-
         settings = self._card(right, bg="#0e1727", padx=14, pady=14)
         settings.pack(fill="x")
         self._label(settings, "SCANNER SETTINGS", 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
@@ -187,7 +193,6 @@ class FaceAttendanceApp(tk.Tk):
         self.threshold_label.pack(anchor="w", pady=(8, 2))
         self.sound_label = self._label(settings, "Sound: dashboard setting", 9, fg="#8b9db6", bg="#0e1727")
         self.sound_label.pack(anchor="w")
-
         footer = tk.Frame(self, bg="#0b1321", padx=20, pady=10)
         footer.pack(fill="x")
         tk.Label(footer, textvariable=self.status, anchor="w", bg="#0b1321", fg="#91a1b8", font=("Segoe UI", 9)).pack(fill="x")
@@ -338,7 +343,6 @@ class FaceAttendanceApp(tk.Tk):
                 return [], None, None, False, missing.message
             self.liveness.reset()
             return locations, None, None, False, "Only one person may be in frame"
-
         full_location = tuple(value * 4 for value in locations[0])
         live = self.liveness.evaluate(frame, full_location)
         if not live.allowed:
