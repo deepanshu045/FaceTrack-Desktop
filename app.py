@@ -329,8 +329,16 @@ class FaceAttendanceApp(tk.Tk):
         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         locations = face_recognition.face_locations(rgb_small, model="hog")
         if len(locations) != 1:
+            if not locations:
+                missing = self.liveness.evaluate_missing_face(frame)
+                recent = self.liveness.recent_face_location
+                if recent is not None:
+                    cached = tuple(max(0, int(value / 4)) for value in recent)
+                    return [cached], None, None, False, missing.message
+                return [], None, None, False, missing.message
             self.liveness.reset()
-            return locations, None, None, False, "No face detected" if not locations else "Only one person may be in frame"
+            return locations, None, None, False, "Only one person may be in frame"
+
         full_location = tuple(value * 4 for value in locations[0])
         live = self.liveness.evaluate(frame, full_location)
         if not live.allowed:
@@ -375,6 +383,10 @@ class FaceAttendanceApp(tk.Tk):
             self.status.set(message)
             return
         if match_index is None:
+            if distance is None:
+                self.person.set("Blink verified • Face reacquiring…")
+                self.status.set(message)
+                return
             self.person.set(f"Unknown face • distance {distance:.3f}")
             self.status.set("Live face verified, but the face is not registered.")
             return
