@@ -17,15 +17,8 @@ from PIL import Image, ImageTk
 from backend_bridge import AttendanceRepository, RecognitionSettings, RegisteredStudent
 from liveness import LivenessGuard
 
-
 RESOLUTIONS = {"480p": (640, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
-RecognitionResult = tuple[
-    list[tuple[int, int, int, int]],
-    int | None,
-    float | None,
-    bool,
-    str,
-]
+RecognitionResult = tuple[list[tuple[int, int, int, int]], int | None, float | None, bool, str]
 
 
 class FaceAttendanceApp(tk.Tk):
@@ -35,7 +28,6 @@ class FaceAttendanceApp(tk.Tk):
         self.geometry("1180x760")
         self.minsize(980, 650)
         self.configure(bg="#101820")
-
         self.camera: cv2.VideoCapture | None = None
         self.capture_thread: Thread | None = None
         self.capture_stop = Event()
@@ -52,7 +44,6 @@ class FaceAttendanceApp(tk.Tk):
         self.last_match_at = 0.0
         self.running = False
         self.liveness = LivenessGuard()
-
         self.camera_index = tk.IntVar(value=0)
         self.resolution = tk.StringVar(value="720p")
         self.target_fps = tk.StringVar(value="30")
@@ -69,14 +60,7 @@ class FaceAttendanceApp(tk.Tk):
     def _build_college_access_page(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(
-            "College.TCombobox",
-            foreground="#111827",
-            fieldbackground="#ffffff",
-            background="#ffffff",
-            selectforeground="#111827",
-            selectbackground="#dbeafe",
-        )
+        style.configure("College.TCombobox", foreground="#111827", fieldbackground="#ffffff", background="#ffffff", selectforeground="#111827", selectbackground="#dbeafe")
         self.access_page = tk.Frame(self, bg="#101820", padx=32, pady=32)
         self.access_page.pack(fill="both", expand=True)
         card = tk.Frame(self.access_page, bg="#17232e", padx=36, pady=32)
@@ -108,9 +92,7 @@ class FaceAttendanceApp(tk.Tk):
         self.access_page.destroy()
         self._build_ui()
         self._apply_recognition_settings(self.settings)
-        self.status.set(
-            f"Loaded {len(self.students)} registered face(s) for {self.selected_college_slug}. Start the camera when ready."
-        )
+        self.status.set(f"Loaded {len(self.students)} registered face(s) for {self.selected_college_slug}. Start the camera when ready.")
 
     def _load_college_data(self) -> None:
         self.repository = AttendanceRepository(self.access_code.get())
@@ -124,11 +106,7 @@ class FaceAttendanceApp(tk.Tk):
         controls = tk.Frame(self, bg="#17232e", padx=16, pady=14)
         controls.pack(fill="x")
         ttk.Style(self).theme_use("clam")
-        for label, variable, values, width in (
-            ("Camera", self.camera_index, (0, 1, 2, 3), 6),
-            ("Quality", self.resolution, tuple(RESOLUTIONS), 8),
-            ("FPS", self.target_fps, ("15", "24", "30", "60"), 6),
-        ):
+        for label, variable, values, width in (("Camera", self.camera_index, (0, 1, 2, 3), 6), ("Quality", self.resolution, tuple(RESOLUTIONS), 8), ("FPS", self.target_fps, ("15", "24", "30", "60"), 6)):
             tk.Label(controls, text=label, bg="#17232e", fg="#dbeafe").pack(side="left", padx=(0, 5))
             ttk.Combobox(controls, textvariable=variable, values=values, width=width, state="readonly").pack(side="left", padx=(0, 14))
         tk.Label(controls, text="Recognition threshold", bg="#17232e", fg="#dbeafe").pack(side="left", padx=(0, 6))
@@ -138,7 +116,6 @@ class FaceAttendanceApp(tk.Tk):
         self.sound_label.pack(side="left", padx=(0, 14))
         ttk.Button(controls, text="Start camera", command=self.start).pack(side="left", padx=4)
         ttk.Button(controls, text="Stop", command=self.stop).pack(side="left", padx=4)
-
         body = tk.Frame(self, bg="#101820", padx=16, pady=16)
         body.pack(fill="both", expand=True)
         self.video_label = tk.Label(body, text="Camera preview", bg="#050a0f", fg="#9ca3af", font=("Segoe UI", 18), anchor="center")
@@ -175,9 +152,7 @@ class FaceAttendanceApp(tk.Tk):
             self.liveness_status.set("Liveness: AI check + blink required")
             self.capture_thread = Thread(target=self._capture_loop, args=(self.camera,), daemon=True)
             self.capture_thread.start()
-            self.status.set(
-                f"Scanning {self.selected_college_slug}. A real face must pass AI anti-spoofing and blink once before attendance."
-            )
+            self.status.set(f"Scanning {self.selected_college_slug}. A real face must pass AI anti-spoofing and blink once before attendance.")
             self._next_frame()
         except Exception as error:
             self.stop()
@@ -219,19 +194,29 @@ class FaceAttendanceApp(tk.Tk):
             return
         self._collect_recognition()
         self._draw_latest_recognition(frame)
-        self._schedule_recognition(frame)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Keep preview work cheap: resize before converting to PIL instead of
+        # converting the full 720p/1080p frame on every UI tick.
+        preview_frame = frame
+        max_width, max_height = 850, 640
+        height, width = frame.shape[:2]
+        scale = min(max_width / width, max_height / height, 1.0)
+        if scale < 1.0:
+            preview_frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
-        image.thumbnail((850, 640))
         preview = ImageTk.PhotoImage(image=image)
         self.video_label.configure(image=preview, text="")
         self.video_label.image = preview
+        self._schedule_recognition(frame)
         self.after(max(1, round(1000 / int(self.target_fps.get()))), self._next_frame)
 
     def _schedule_recognition(self, frame: np.ndarray) -> None:
         if self.recognition_future is not None or time.monotonic() < self.next_recognition_at:
             return
-        self.next_recognition_at = time.monotonic() + 0.20
+        # Face recognition + landmarks are expensive. The camera itself remains
+        # at the selected FPS while recognition samples only twice per second.
+        self.next_recognition_at = time.monotonic() + 0.50
         token = self.scan_token
         students = self.students
         threshold = self.threshold.get()
@@ -251,18 +236,15 @@ class FaceAttendanceApp(tk.Tk):
             return
         self._update_recognition_status()
 
-    def _recognize(
-        self, frame: np.ndarray, students: list[RegisteredStudent], threshold: float
-    ) -> RecognitionResult:
-        small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+    def _recognize(self, frame: np.ndarray, students: list[RegisteredStudent], threshold: float) -> RecognitionResult:
+        # Detect and encode at 1/4 resolution; this is the existing recognition path.
+        small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         locations = face_recognition.face_locations(rgb_small, model="hog")
         if len(locations) != 1:
             self.liveness.reset()
             return locations, None, None, False, "No face detected" if not locations else "Only one person may be in frame"
 
-        # Liveness runs before face matching. Recognition/attendance can never
-        # succeed for a face that has not passed both anti-spoofing and the blink challenge.
         full_location = tuple(value * 4 for value in locations[0])
         live = self.liveness.evaluate(frame, full_location)
         if not live.allowed:
@@ -311,7 +293,6 @@ class FaceAttendanceApp(tk.Tk):
             self.person.set(f"Unknown face\nDistance: {distance:.3f}")
             self.status.set("Live face verified, but the face is not registered or is below the selected confidence.")
             return
-
         student = self.students[match_index]
         self.person.set(f"{student.name}\n{student.roll_no}\n{student.department}\nMatch distance: {distance:.3f}")
         now = time.monotonic()
@@ -336,9 +317,7 @@ class FaceAttendanceApp(tk.Tk):
     def _apply_recognition_settings(self, settings: RecognitionSettings) -> None:
         self.threshold.set(settings.distance_threshold)
         self.sound_enabled.set(settings.sound_alerts)
-        self.threshold_label.configure(
-            text=f"{settings.confidence_threshold}% (distance {settings.distance_threshold:.2f})"
-        )
+        self.threshold_label.configure(text=f"{settings.confidence_threshold}% (distance {settings.distance_threshold:.2f})")
         self.sound_label.configure(text=f"Sound: {'on' if settings.sound_alerts else 'off'} (dashboard)")
 
     @staticmethod
