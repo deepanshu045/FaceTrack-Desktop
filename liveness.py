@@ -1,24 +1,36 @@
-"""Face liveness / anti-spoofing guard for FaceTrack Live.
+"""Lightweight face liveness and anti-spoofing for FaceTrack Live.
 
-The guard deliberately fails closed: a face is allowed to reach attendance
-recognition only after both checks pass:
+The guard deliberately fails closed. A face reaches face recognition only after:
 
-1. DeepFace's neural anti-spoofing model classifies the camera face as real.
+1. A small MiniFASNetV2 ONNX model classifies the camera face as real.
 2. The person completes an active blink challenge.
 
-The anti-spoof model is loaded lazily because its first use downloads the
-pre-trained weights. Subsequent checks reuse the loaded model/cache.
+The anti-spoof model is downloaded once on first use (~1.8 MB) and then reused
+locally. ONNX Runtime is used instead of TensorFlow/DeepFace so the desktop app
+stays substantially lighter.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
+import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import face_recognition
 import numpy as np
+
+
+MODEL_URL = (
+    "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/"
+    "MiniFASNetV2.onnx"
+)
+MODEL_SHA256 = "b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907"
+MODEL_SIZE = (80, 80)
+MODEL_SCALE = 2.7
 
 
 @dataclass(frozen=True)
@@ -31,7 +43,7 @@ class LivenessResult:
 
 
 class LivenessGuard:
-    """Stateful liveness challenge used by the recognition worker."""
+    """Stateful AI anti-spoof + active blink challenge."""
 
     def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 0.8) -> None:
         self.challenge_timeout = challenge_timeout
@@ -43,8 +55,9 @@ class LivenessGuard:
         self._last_ai_real = False
         self._last_ai_score: float | None = None
         self._ai_error: str | None = None
-        self._deepface = None
-        self._deepface_load_error: str | None = None
+        self._session = None
+        self._input_name: str | None = None
+        self._output_name: str | None = None
 
     def reset(self) -> None:
         self.challenge_started = time.monotonic()
@@ -64,7 +77,7 @@ class LivenessGuard:
         frame: np.ndarray,
         location: tuple[int, int, int, int],
     ) -> LivenessResult:
-        """Evaluate one face. The input location is in the frame's current scale."""
+        """Evaluate one face. Location is top/right/bottom/left in frame pixels."""
         if time.monotonic() - self.challenge_started > self.challenge_timeout:
             self.reset()
             return LivenessResult(False, False, False, None, "Liveness timed out — please blink again.")
@@ -78,28 +91,78 @@ class LivenessGuard:
         if right <= left or bottom <= top:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Face is out of frame.")
 
-        # Use a little margin so the anti-spoof model sees the whole face region.
         pad_x = int((right - left) * 0.20)
         pad_y = int((bottom - top) * 0.25)
-        crop = frame[max(0, top - pad_y):min(height, bottom + pad_y),
-                     max(0, left - pad_x):min(width, right + pad_x)]
+        crop = frame[
+            max(0, top - pad_y) : min(height, bottom + pad_y),
+            max(0, left - pad_x) : min(width, right + pad_x),
+        ]
         if crop.size == 0:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Unable to read face.")
 
+        # The blink challenge is cheap and runs on every recognition sample.
         self._update_blink(crop)
+        # The neural anti-spoof model runs less often to keep CPU usage low.
         self._update_ai_spoof(crop)
 
         if self._ai_error:
-            return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
-                                  f"Anti-spoofing unavailable: {self._ai_error}")
+            return LivenessResult(
+                False,
+                False,
+                self.blink_verified,
+                self._last_ai_score,
+                f"Anti-spoofing unavailable: {self._ai_error}",
+            )
         if not self._last_ai_real:
-            return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
-                                  "Possible photo/screen detected — use your real face.")
+            return LivenessResult(
+                False,
+                False,
+                self.blink_verified,
+                self._last_ai_score,
+                "Possible photo/screen detected — use your real face.",
+            )
         if not self.blink_verified:
             remaining = max(0.0, self.challenge_timeout - (time.monotonic() - self.challenge_started))
-            return LivenessResult(False, True, False, self._last_ai_score,
-                                  f"Live face detected. Blink once ({remaining:.0f}s).")
+            return LivenessResult(
+                False,
+                True,
+                False,
+                self._last_ai_score,
+                f"Live face detected. Blink once ({remaining:.0f}s).",
+            )
         return LivenessResult(True, True, True, self._last_ai_score, "Liveness verified.")
+
+    def _ensure_model(self) -> None:
+        if self._session is not None:
+            return
+
+        import onnxruntime as ort
+
+        model_dir = Path.home() / ".facetrack" / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_path = model_dir / "MiniFASNetV2.onnx"
+
+        if not model_path.exists() or not self._valid_model(model_path):
+            temp_path = model_path.with_suffix(".download")
+            urllib.request.urlretrieve(MODEL_URL, temp_path)
+            if not self._valid_model(temp_path):
+                temp_path.unlink(missing_ok=True)
+                raise RuntimeError("Downloaded anti-spoofing model failed its integrity check.")
+            temp_path.replace(model_path)
+
+        self._session = ort.InferenceSession(model_path.as_posix(), providers=["CPUExecutionProvider"])
+        self._input_name = self._session.get_inputs()[0].name
+        self._output_name = self._session.get_outputs()[0].name
+
+    @staticmethod
+    def _valid_model(path: Path) -> bool:
+        if not path.exists() or path.stat().st_size < 100_000:
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == MODEL_SHA256
 
     def _update_ai_spoof(self, crop: np.ndarray) -> None:
         now = time.monotonic()
@@ -108,28 +171,38 @@ class LivenessGuard:
         self._last_ai_check = now
         self._ai_error = None
         try:
-            if self._deepface is None:
-                from deepface import DeepFace
-                self._deepface = DeepFace
-            faces = self._deepface.extract_faces(
-                img_path=crop,
-                detector_backend="opencv",
-                enforce_detection=False,
-                align=True,
-                anti_spoofing=True,
-            )
-            if not faces:
-                self._last_ai_real = False
-                self._last_ai_score = 0.0
-                return
-            face = faces[0]
-            self._last_ai_real = bool(face.get("is_real", False))
-            raw_score = face.get("antispoof_score", face.get("anti_spoofing_score"))
-            self._last_ai_score = float(raw_score) if raw_score is not None else None
+            self._ensure_model()
+            assert self._session is not None
+            assert self._input_name is not None
+            assert self._output_name is not None
+
+            face = self._crop_for_model(crop)
+            tensor = np.transpose(face.astype(np.float32), (2, 0, 1))[None, ...]
+            logits = self._session.run([self._output_name], {self._input_name: tensor})[0]
+            probabilities = self._softmax(logits)
+            real_score = float(probabilities[0, 1])
+            self._last_ai_score = real_score
+            self._last_ai_real = real_score >= 0.70
         except Exception as error:
             self._last_ai_real = False
             self._last_ai_score = None
             self._ai_error = str(error)
+
+    @staticmethod
+    def _crop_for_model(image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        # MiniFASNetV2 expects an expanded face crop. The caller already supplies
+        # a face crop with margin, so this keeps the whole crop while preserving it.
+        scale = min((height - 1) / max(height, 1), (width - 1) / max(width, 1), MODEL_SCALE)
+        _ = scale  # retained to document the model's reference crop scale
+        return cv2.resize(image, MODEL_SIZE, interpolation=cv2.INTER_LINEAR)
+
+    @staticmethod
+    def _softmax(logits: np.ndarray) -> np.ndarray:
+        values = np.asarray(logits, dtype=np.float32)
+        values = values - np.max(values, axis=1, keepdims=True)
+        exp_values = np.exp(values)
+        return exp_values / np.sum(exp_values, axis=1, keepdims=True)
 
     def _update_blink(self, crop: np.ndarray) -> None:
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
@@ -145,7 +218,6 @@ class LivenessGuard:
         if not left_eye or not right_eye:
             return
         ear = (self._eye_aspect_ratio(left_eye) + self._eye_aspect_ratio(right_eye)) / 2.0
-        # The threshold is intentionally conservative; the challenge is only one blink.
         closed = ear < 0.20
         if closed:
             self._eye_was_closed = True
