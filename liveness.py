@@ -32,7 +32,7 @@ class LivenessResult:
 class LivenessGuard:
     """Stateful AI anti-spoof + active blink challenge with low CPU overhead."""
 
-    def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 1.0) -> None:
+    def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 2.0) -> None:
         self.challenge_timeout = challenge_timeout
         self.spoof_refresh = spoof_refresh
         self.challenge_started = time.monotonic()
@@ -116,12 +116,7 @@ class LivenessGuard:
         return LivenessResult(True, True, True, self._last_ai_score, "Liveness verified.")
 
     def evaluate_missing_face(self, frame: np.ndarray) -> LivenessResult:
-        """Handle a short detector dropout, especially the frame where eyes close.
-
-        HOG can occasionally fail for the single frame in which a person blinks.
-        Do not reset the challenge immediately. Reuse the last face box briefly
-        so the closed-eye frame can complete the blink transition.
-        """
+        """Handle a short detector dropout, especially the frame where eyes close."""
         location = self.recent_face_location
         if location is None:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "No face detected")
@@ -157,7 +152,19 @@ class LivenessGuard:
                 temp_path.unlink(missing_ok=True)
                 raise RuntimeError("Downloaded anti-spoofing model failed its integrity check.")
             temp_path.replace(model_path)
-        self._session = ort.InferenceSession(model_path.as_posix(), providers=["CPUExecutionProvider"])
+
+        # Keep ONNX Runtime deliberately single-threaded. The model is tiny,
+        # and many threads cost more CPU/RAM than they save on laptops.
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self._session = ort.InferenceSession(
+            model_path.as_posix(),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
@@ -197,8 +204,13 @@ class LivenessGuard:
             self._ai_error = str(error)
 
     def _update_blink(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> None:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        landmarks = face_recognition.face_landmarks(rgb, [location])
+        # Facial landmarks are much more expensive than the HOG detector.
+        # Run them on a half-size image; this is still accurate enough for EAR.
+        scale = 0.5
+        small = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        small_location = tuple(int(value * scale) for value in location)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        landmarks = face_recognition.face_landmarks(rgb, [small_location])
         if not landmarks:
             return
         eyes = landmarks[0]
