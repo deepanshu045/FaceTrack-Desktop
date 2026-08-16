@@ -1,4 +1,4 @@
-"""FaceTrack Live - a one-person live face-attendance desktop application."""
+"""FaceTrack Live - live face attendance with anti-spoofing and liveness."""
 
 from __future__ import annotations
 
@@ -15,9 +15,17 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from backend_bridge import AttendanceRepository, RecognitionSettings, RegisteredStudent
+from liveness import LivenessGuard
 
 
 RESOLUTIONS = {"480p": (640, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
+RecognitionResult = tuple[
+    list[tuple[int, int, int, int]],
+    int | None,
+    float | None,
+    bool,
+    str,
+]
 
 
 class FaceAttendanceApp(tk.Tk):
@@ -34,15 +42,16 @@ class FaceAttendanceApp(tk.Tk):
         self.frame_lock = Lock()
         self.latest_frame: np.ndarray | None = None
         self.recognizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-recognition")
-        self.recognition_future: Future[tuple[list[tuple[int, int, int, int]], int | None, float | None]] | None = None
+        self.recognition_future: Future[RecognitionResult] | None = None
         self.next_recognition_at = 0.0
-        self.latest_recognition: tuple[list[tuple[int, int, int, int]], int | None, float | None] | None = None
+        self.latest_recognition: RecognitionResult | None = None
         self.scan_token = 0
         self.repository: AttendanceRepository | None = None
         self.students: list[RegisteredStudent] = []
         self.last_match_id: int | None = None
         self.last_match_at = 0.0
         self.running = False
+        self.liveness = LivenessGuard()
 
         self.camera_index = tk.IntVar(value=0)
         self.resolution = tk.StringVar(value="720p")
@@ -51,6 +60,7 @@ class FaceAttendanceApp(tk.Tk):
         self.sound_enabled = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Ready. Start scanning when the camera is available.")
         self.person = tk.StringVar(value="No face detected")
+        self.liveness_status = tk.StringVar(value="Liveness: waiting")
         self.access_code = tk.StringVar()
         self.selected_college_slug = ""
         self._build_college_access_page()
@@ -103,7 +113,6 @@ class FaceAttendanceApp(tk.Tk):
         )
 
     def _load_college_data(self) -> None:
-        """Validate the access code before exposing or loading college data."""
         self.repository = AttendanceRepository(self.access_code.get())
         self.selected_college_slug = self.repository.college_slug
         self.settings = self.repository.recognition_settings()
@@ -122,7 +131,6 @@ class FaceAttendanceApp(tk.Tk):
         ):
             tk.Label(controls, text=label, bg="#17232e", fg="#dbeafe").pack(side="left", padx=(0, 5))
             ttk.Combobox(controls, textvariable=variable, values=values, width=width, state="readonly").pack(side="left", padx=(0, 14))
-
         tk.Label(controls, text="Recognition threshold", bg="#17232e", fg="#dbeafe").pack(side="left", padx=(0, 6))
         self.threshold_label = tk.Label(controls, text="Dashboard setting", bg="#17232e", fg="#dbeafe", width=22)
         self.threshold_label.pack(side="left", padx=(5, 14))
@@ -139,16 +147,15 @@ class FaceAttendanceApp(tk.Tk):
         info.pack(side="right", fill="y", padx=(16, 0))
         info.pack_propagate(False)
         tk.Label(info, text="LIVE ATTENDANCE", font=("Segoe UI", 12, "bold"), bg="#17232e", fg="#60a5fa").pack(anchor="w")
-        tk.Label(info, textvariable=self.person, justify="left", wraplength=240, font=("Segoe UI", 16, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(22, 20))
-        tk.Label(info, text="Rules", font=("Segoe UI", 11, "bold"), bg="#17232e", fg="white").pack(anchor="w")
-        tk.Label(info, text="• One face only\n• Match must be a registered student\n• Attendance is recorded once per day", justify="left", bg="#17232e", fg="#cbd5e1").pack(anchor="w", pady=(8, 22))
+        tk.Label(info, textvariable=self.person, justify="left", wraplength=240, font=("Segoe UI", 16, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(22, 14))
+        tk.Label(info, textvariable=self.liveness_status, justify="left", wraplength=240, font=("Segoe UI", 11, "bold"), bg="#17232e", fg="#fbbf24").pack(anchor="w", pady=(0, 20))
+        tk.Label(info, text="Security rules", font=("Segoe UI", 11, "bold"), bg="#17232e", fg="white").pack(anchor="w")
+        tk.Label(info, text="• One face only\n• AI anti-spoofing must pass\n• Blink challenge must pass\n• Registered student required\n• Attendance once per day", justify="left", bg="#17232e", fg="#cbd5e1").pack(anchor="w", pady=(8, 22))
         tk.Label(self, textvariable=self.status, anchor="w", padx=16, pady=10, bg="#0b1118", fg="#cbd5e1").pack(fill="x")
 
     def start(self) -> None:
         self.stop()
         try:
-            # Refresh the matched college's data in case its dashboard or
-            # student records changed after the access screen was opened.
             self._load_college_data()
             self._apply_recognition_settings(self.settings)
             self.camera = cv2.VideoCapture(self.camera_index.get(), cv2.CAP_DSHOW)
@@ -156,20 +163,21 @@ class FaceAttendanceApp(tk.Tk):
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.camera.set(cv2.CAP_PROP_FPS, int(self.target_fps.get()))
-            # Avoid displaying old frames when recognition is slower than the camera.
             self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not self.camera.isOpened():
                 raise RuntimeError("Camera could not be opened. Check the selected camera number.")
             self.running = True
             self.scan_token += 1
             self.capture_stop.clear()
-            with self.frame_lock:
-                self.latest_frame = None
+            self.liveness.reset()
             self.latest_recognition = None
             self.next_recognition_at = 0.0
+            self.liveness_status.set("Liveness: AI check + blink required")
             self.capture_thread = Thread(target=self._capture_loop, args=(self.camera,), daemon=True)
             self.capture_thread.start()
-            self.status.set(f"Scanning {self.selected_college_slug} with {len(self.students)} registered face(s) at {self.settings.confidence_threshold}% confidence.")
+            self.status.set(
+                f"Scanning {self.selected_college_slug}. A real face must pass AI anti-spoofing and blink once before attendance."
+            )
             self._next_frame()
         except Exception as error:
             self.stop()
@@ -188,10 +196,12 @@ class FaceAttendanceApp(tk.Tk):
         with self.frame_lock:
             self.latest_frame = None
         self.latest_recognition = None
-        self.status.set("Camera stopped.")
+        if hasattr(self, "liveness_status"):
+            self.liveness_status.set("Liveness: waiting")
+        if hasattr(self, "status"):
+            self.status.set("Camera stopped.")
 
     def _capture_loop(self, camera: cv2.VideoCapture) -> None:
-        """Continuously retain only the newest camera frame in a background thread."""
         while not self.capture_stop.is_set() and camera.isOpened():
             ok, frame = camera.read()
             if not ok:
@@ -241,31 +251,42 @@ class FaceAttendanceApp(tk.Tk):
             return
         self._update_recognition_status()
 
-    @staticmethod
     def _recognize(
-        frame: np.ndarray, students: list[RegisteredStudent], threshold: float
-    ) -> tuple[list[tuple[int, int, int, int]], int | None, float | None]:
+        self, frame: np.ndarray, students: list[RegisteredStudent], threshold: float
+    ) -> RecognitionResult:
         small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-        locations = face_recognition.face_locations(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), model="hog")
+        rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        locations = face_recognition.face_locations(rgb_small, model="hog")
         if len(locations) != 1:
-            return locations, None, None
+            self.liveness.reset()
+            return locations, None, None, False, "No face detected" if not locations else "Only one person may be in frame"
 
-        encoding = face_recognition.face_encodings(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), locations)[0]
+        # Liveness runs before face matching. Recognition/attendance can never
+        # succeed for a face that has not passed both anti-spoofing and the blink challenge.
+        full_location = tuple(value * 4 for value in locations[0])
+        live = self.liveness.evaluate(frame, full_location)
+        if not live.allowed:
+            return locations, None, None, False, live.message
+
+        encoding = face_recognition.face_encodings(rgb_small, locations)[0]
         distances = face_recognition.face_distance([s.encoding for s in students], encoding)
         match_index = int(np.argmin(distances))
         distance = float(distances[match_index])
-        return locations, match_index if distance <= threshold else None, distance
+        return locations, match_index if distance <= threshold else None, distance, True, live.message
 
     def _draw_latest_recognition(self, frame: np.ndarray) -> None:
         if self.latest_recognition is None:
             return
-        locations, match_index, distance = self.latest_recognition
+        locations, match_index, distance, live_ok, message = self.latest_recognition
         if len(locations) != 1:
             for top, right, bottom, left in locations:
                 cv2.rectangle(frame, (left * 4, top * 4), (right * 4, bottom * 4), (0, 165, 255), 3)
             return
         top, right, bottom, left = locations[0]
         box = (left * 4, top * 4, right * 4, bottom * 4)
+        if not live_ok:
+            self._draw_box(frame, box, "LIVENESS REQUIRED", (0, 165, 255))
+            return
         if match_index is None:
             self._draw_box(frame, box, "UNKNOWN", (0, 0, 255))
             return
@@ -275,15 +296,20 @@ class FaceAttendanceApp(tk.Tk):
     def _update_recognition_status(self) -> None:
         if self.latest_recognition is None:
             return
-        locations, match_index, distance = self.latest_recognition
+        locations, match_index, distance, live_ok, message = self.latest_recognition
+        self.liveness_status.set(f"Liveness: {'VERIFIED' if live_ok else message}")
         if len(locations) != 1:
             text = "No face detected" if not locations else "Only one person may be in frame"
             self.person.set(text)
             self.status.set(text)
             return
+        if not live_ok:
+            self.person.set("Face detected\nAttendance locked")
+            self.status.set(message)
+            return
         if match_index is None:
             self.person.set(f"Unknown face\nDistance: {distance:.3f}")
-            self.status.set("Face is not registered or is below the selected confidence.")
+            self.status.set("Live face verified, but the face is not registered or is below the selected confidence.")
             return
 
         student = self.students[match_index]
@@ -313,13 +339,10 @@ class FaceAttendanceApp(tk.Tk):
         self.threshold_label.configure(
             text=f"{settings.confidence_threshold}% (distance {settings.distance_threshold:.2f})"
         )
-        self.sound_label.configure(
-            text=f"Sound: {'on' if settings.sound_alerts else 'off'} (dashboard)"
-        )
+        self.sound_label.configure(text=f"Sound: {'on' if settings.sound_alerts else 'off'} (dashboard)")
 
     @staticmethod
     def _play_recognition_sound() -> None:
-        """Use Windows' system sound instead of Tk's often-silent bell."""
         try:
             winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
         except RuntimeError:
