@@ -45,6 +45,9 @@ class LivenessGuard:
         self._session = None
         self._input_name: str | None = None
         self._output_name: str | None = None
+        self._last_face_location: tuple[int, int, int, int] | None = None
+        self._last_face_seen = 0.0
+        self._missing_face_grace = 1.5
 
     def reset(self) -> None:
         self.challenge_started = time.monotonic()
@@ -54,10 +57,20 @@ class LivenessGuard:
         self._last_ai_real = False
         self._last_ai_score = None
         self._ai_error = None
+        self._last_face_location = None
+        self._last_face_seen = 0.0
 
     @property
     def blink_verified(self) -> bool:
         return self.blink_count >= 1
+
+    @property
+    def recent_face_location(self) -> tuple[int, int, int, int] | None:
+        if self._last_face_location is None:
+            return None
+        if time.monotonic() - self._last_face_seen > self._missing_face_grace:
+            return None
+        return self._last_face_location
 
     def evaluate(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> LivenessResult:
         """Evaluate one face using the already-detected face location."""
@@ -65,6 +78,8 @@ class LivenessGuard:
             self.reset()
             return LivenessResult(False, False, False, None, "Liveness timed out — please blink again.")
 
+        self._last_face_location = location
+        self._last_face_seen = time.monotonic()
         top, right, bottom, left = location
         height, width = frame.shape[:2]
         top = max(0, int(top))
@@ -83,12 +98,9 @@ class LivenessGuard:
         if crop.size == 0:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Unable to read face.")
 
-        # Reuse the face location from the main recognition pass. The previous
-        # version ran a second HOG face detector here, which caused unnecessary CPU load.
         if not self.blink_verified:
             self._update_blink(frame, location)
 
-        # The neural model runs only once per second. It is not on the camera/UI thread.
         self._update_ai_spoof(crop)
 
         if self._ai_error:
@@ -102,6 +114,33 @@ class LivenessGuard:
             return LivenessResult(False, True, False, self._last_ai_score,
                                   f"Live face detected. Blink once ({remaining:.0f}s).")
         return LivenessResult(True, True, True, self._last_ai_score, "Liveness verified.")
+
+    def evaluate_missing_face(self, frame: np.ndarray) -> LivenessResult:
+        """Handle a short detector dropout, especially the frame where eyes close.
+
+        HOG can occasionally fail for the single frame in which a person blinks.
+        Do not reset the challenge immediately. Reuse the last face box briefly
+        so the closed-eye frame can complete the blink transition.
+        """
+        location = self.recent_face_location
+        if location is None:
+            return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "No face detected")
+
+        if not self.blink_verified:
+            self._update_blink(frame, location)
+
+        if self._ai_error:
+            return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
+                                  f"Anti-spoofing unavailable: {self._ai_error}")
+        if not self._last_ai_real:
+            return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
+                                  "Possible photo/screen detected — use your real face.")
+        remaining = max(0.0, self.challenge_timeout - (time.monotonic() - self.challenge_started))
+        if not self.blink_verified:
+            return LivenessResult(False, True, False, self._last_ai_score,
+                                  f"Keep face steady. Blink once ({remaining:.0f}s).")
+        return LivenessResult(False, True, True, self._last_ai_score,
+                              "Blink detected ✓ Keep face steady.")
 
     def _ensure_model(self) -> None:
         if self._session is not None:
@@ -158,9 +197,6 @@ class LivenessGuard:
             self._ai_error = str(error)
 
     def _update_blink(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> None:
-        # face_recognition.face_landmarks accepts known locations, so no second
-        # HOG detection is needed. This is substantially cheaper than detecting
-        # the face again inside the liveness crop.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         landmarks = face_recognition.face_landmarks(rgb, [location])
         if not landmarks:
@@ -171,7 +207,7 @@ class LivenessGuard:
         if not left_eye or not right_eye:
             return
         ear = (self._eye_aspect_ratio(left_eye) + self._eye_aspect_ratio(right_eye)) / 2.0
-        closed = ear < 0.20
+        closed = ear < 0.22
         if closed:
             self._eye_was_closed = True
         elif self._eye_was_closed:
