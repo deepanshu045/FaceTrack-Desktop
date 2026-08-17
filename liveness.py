@@ -32,7 +32,7 @@ class LivenessResult:
 class LivenessGuard:
     """Stateful AI anti-spoof + active blink challenge with low CPU overhead."""
 
-    def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 2.0) -> None:
+    def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 1.5) -> None:
         self.challenge_timeout = challenge_timeout
         self.spoof_refresh = spoof_refresh
         self.challenge_started = time.monotonic()
@@ -48,6 +48,7 @@ class LivenessGuard:
         self._last_face_location: tuple[int, int, int, int] | None = None
         self._last_face_seen = 0.0
         self._missing_face_grace = 1.5
+        self._live_confirmations = 0
 
     def reset(self) -> None:
         self.challenge_started = time.monotonic()
@@ -59,6 +60,7 @@ class LivenessGuard:
         self._ai_error = None
         self._last_face_location = None
         self._last_face_seen = 0.0
+        self._live_confirmations = 0
 
     @property
     def blink_verified(self) -> bool:
@@ -89,12 +91,7 @@ class LivenessGuard:
         if right <= left or bottom <= top:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Face is out of frame.")
 
-        pad_x = int((right - left) * 0.20)
-        pad_y = int((bottom - top) * 0.25)
-        crop = frame[
-            max(0, top - pad_y) : min(height, bottom + pad_y),
-            max(0, left - pad_x) : min(width, right + pad_x),
-        ]
+        crop = self._anti_spoof_crop(frame, (top, right, bottom, left))
         if crop.size == 0:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Unable to read face.")
 
@@ -113,6 +110,9 @@ class LivenessGuard:
             remaining = max(0.0, self.challenge_timeout - (time.monotonic() - self.challenge_started))
             return LivenessResult(False, True, False, self._last_ai_score,
                                   f"Live face detected. Blink once ({remaining:.0f}s).")
+        if self._live_confirmations < 2:
+            return LivenessResult(False, True, True, self._last_ai_score,
+                                  "Blink detected ✓ Verifying live face…")
         return LivenessResult(True, True, True, self._last_ai_score, "Liveness verified.")
 
     def evaluate_missing_face(self, frame: np.ndarray) -> LivenessResult:
@@ -134,8 +134,28 @@ class LivenessGuard:
         if not self.blink_verified:
             return LivenessResult(False, True, False, self._last_ai_score,
                                   f"Keep face steady. Blink once ({remaining:.0f}s).")
+        if self._live_confirmations < 2:
+            return LivenessResult(False, True, True, self._last_ai_score,
+                                  "Blink detected ✓ Verifying live face…")
         return LivenessResult(False, True, True, self._last_ai_score,
                               "Blink detected ✓ Keep face steady.")
+
+    @staticmethod
+    def _anti_spoof_crop(frame: np.ndarray, location: tuple[int, int, int, int]) -> np.ndarray:
+        """Create the 2.7x centered crop expected by MiniFASNetV2."""
+        top, right, bottom, left = location
+        h, w = frame.shape[:2]
+        cx = (left + right) / 2.0
+        cy = (top + bottom) / 2.0
+        face_w = max(1.0, right - left)
+        face_h = max(1.0, bottom - top)
+        crop_w = face_w * 2.7
+        crop_h = face_h * 2.7
+        x1 = max(0, int(cx - crop_w / 2))
+        y1 = max(0, int(cy - crop_h / 2))
+        x2 = min(w, int(cx + crop_w / 2))
+        y2 = min(h, int(cy + crop_h / 2))
+        return frame[y1:y2, x1:x2]
 
     def _ensure_model(self) -> None:
         if self._session is not None:
@@ -153,8 +173,6 @@ class LivenessGuard:
                 raise RuntimeError("Downloaded anti-spoofing model failed its integrity check.")
             temp_path.replace(model_path)
 
-        # Keep ONNX Runtime deliberately single-threaded. The model is tiny,
-        # and many threads cost more CPU/RAM than they save on laptops.
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
@@ -190,22 +208,28 @@ class LivenessGuard:
             assert self._input_name is not None
             assert self._output_name is not None
             face = cv2.resize(crop, MODEL_SIZE, interpolation=cv2.INTER_LINEAR)
-            tensor = np.transpose(face.astype(np.float32), (2, 0, 1))[None, ...]
-            logits = self._session.run([self._output_name], {self._input_name: tensor})[0]
-            values = np.asarray(logits, dtype=np.float32)
-            values -= np.max(values, axis=1, keepdims=True)
-            probabilities = np.exp(values)
+            # MiniFASNetV2 expects BGR float32 pixels normalized to [0, 1].
+            tensor = np.transpose(face.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
+            logits = np.asarray(self._session.run([self._output_name], {self._input_name: tensor})[0], dtype=np.float32)
+            logits -= np.max(logits, axis=1, keepdims=True)
+            probabilities = np.exp(logits)
             probabilities /= np.sum(probabilities, axis=1, keepdims=True)
-            self._last_ai_score = float(probabilities[0, 1])
-            self._last_ai_real = self._last_ai_score >= 0.70
+            # MiniFASNetV2 classes are [print/spoof, live, replay/spoof].
+            live_score = float(probabilities[0, 1])
+            self._last_ai_score = live_score
+            if live_score >= 0.80:
+                self._live_confirmations += 1
+                self._last_ai_real = True
+            else:
+                self._live_confirmations = 0
+                self._last_ai_real = False
         except Exception as error:
             self._last_ai_real = False
+            self._live_confirmations = 0
             self._last_ai_score = None
             self._ai_error = str(error)
 
     def _update_blink(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> None:
-        # Facial landmarks are much more expensive than the HOG detector.
-        # Run them on a half-size image; this is still accurate enough for EAR.
         scale = 0.5
         small = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         small_location = tuple(int(value * scale) for value in location)
