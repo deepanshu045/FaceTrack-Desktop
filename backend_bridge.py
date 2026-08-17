@@ -1,7 +1,8 @@
-"""HTTP adapter between the desktop camera app and the deployed FaceTrack backend."""
+"""HTTP adapter between the desktop camera app and the FaceTrack FastAPI backend."""
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -10,7 +11,11 @@ import numpy as np
 import requests
 
 
-DEFAULT_BACKEND_URL = os.getenv("FACE_ATTENDANCE_BACKEND_URL", "https://facetrack-ggbe.onrender.com").rstrip("/")
+logger = logging.getLogger(__name__)
+# The desktop app talks to the local FastAPI server by default. Override this
+# when the backend is deployed somewhere else:
+#   set FACE_ATTENDANCE_BACKEND_URL=http://127.0.0.1:8000
+DEFAULT_BACKEND_URL = os.getenv("FACE_ATTENDANCE_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -40,12 +45,23 @@ def _api_url(path: str) -> str:
 
 
 def _request_json(method: str, path: str, **kwargs) -> dict:
-    response = requests.request(method, _api_url(path), timeout=20, **kwargs)
+    url = _api_url(path)
+    logger.info("Backend request: %s %s", method.upper(), url)
+    try:
+        response = requests.request(method, url, timeout=20, **kwargs)
+    except requests.RequestException as exc:
+        logger.error("Backend connection failed: %s", exc)
+        raise RuntimeError(
+            f"Cannot connect to FaceTrack backend at {DEFAULT_BACKEND_URL}. "
+            "Start the FastAPI server or set FACE_ATTENDANCE_BACKEND_URL."
+        ) from exc
+
     try:
         payload = response.json()
     except ValueError:
         payload = {"detail": response.text}
 
+    logger.info("Backend response: %s %s", response.status_code, response.url)
     if response.status_code >= 400:
         detail = payload.get("detail") if isinstance(payload, dict) else payload
         raise RuntimeError(detail or f"Request failed with status {response.status_code}.")
