@@ -75,7 +75,6 @@ class LivenessGuard:
         return self._last_face_location
 
     def evaluate(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> LivenessResult:
-        """Evaluate one face using the already-detected face location."""
         if time.monotonic() - self.challenge_started > self.challenge_timeout:
             self.reset()
             return LivenessResult(False, False, False, None, "Liveness timed out — please blink again.")
@@ -84,21 +83,15 @@ class LivenessGuard:
         self._last_face_seen = time.monotonic()
         top, right, bottom, left = location
         height, width = frame.shape[:2]
-        top = max(0, int(top))
-        right = min(width, int(right))
-        bottom = min(height, int(bottom))
-        left = max(0, int(left))
+        top = max(0, int(top)); right = min(width, int(right))
+        bottom = min(height, int(bottom)); left = max(0, int(left))
         if right <= left or bottom <= top:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Face is out of frame.")
-
-        crop = self._anti_spoof_crop(frame, (top, right, bottom, left))
-        if crop.size == 0:
-            return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "Unable to read face.")
 
         if not self.blink_verified:
             self._update_blink(frame, location)
 
-        self._update_ai_spoof(crop)
+        self._update_ai_spoof(frame, (top, right, bottom, left))
 
         if self._ai_error:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
@@ -116,52 +109,30 @@ class LivenessGuard:
         return LivenessResult(True, True, True, self._last_ai_score, "Liveness verified.")
 
     def evaluate_missing_face(self, frame: np.ndarray) -> LivenessResult:
-        """Handle a short detector dropout, especially the frame where eyes close."""
         location = self.recent_face_location
         if location is None:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score, "No face detected")
-
         if not self.blink_verified:
             self._update_blink(frame, location)
-
         if self._ai_error:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
                                   f"Anti-spoofing unavailable: {self._ai_error}")
         if not self._last_ai_real:
             return LivenessResult(False, False, self.blink_verified, self._last_ai_score,
                                   "Possible photo/screen detected — use your real face.")
-        remaining = max(0.0, self.challenge_timeout - (time.monotonic() - self.challenge_started))
         if not self.blink_verified:
+            remaining = max(0.0, self.challenge_timeout - (time.monotonic() - self.challenge_started))
             return LivenessResult(False, True, False, self._last_ai_score,
                                   f"Keep face steady. Blink once ({remaining:.0f}s).")
         if self._live_confirmations < 2:
             return LivenessResult(False, True, True, self._last_ai_score,
                                   "Blink detected ✓ Verifying live face…")
-        return LivenessResult(False, True, True, self._last_ai_score,
-                              "Blink detected ✓ Keep face steady.")
-
-    @staticmethod
-    def _anti_spoof_crop(frame: np.ndarray, location: tuple[int, int, int, int]) -> np.ndarray:
-        """Create the 2.7x centered crop expected by MiniFASNetV2."""
-        top, right, bottom, left = location
-        h, w = frame.shape[:2]
-        cx = (left + right) / 2.0
-        cy = (top + bottom) / 2.0
-        face_w = max(1.0, right - left)
-        face_h = max(1.0, bottom - top)
-        crop_w = face_w * 2.7
-        crop_h = face_h * 2.7
-        x1 = max(0, int(cx - crop_w / 2))
-        y1 = max(0, int(cy - crop_h / 2))
-        x2 = min(w, int(cx + crop_w / 2))
-        y2 = min(h, int(cy + crop_h / 2))
-        return frame[y1:y2, x1:x2]
+        return LivenessResult(False, True, True, self._last_ai_score, "Blink detected ✓ Keep face steady.")
 
     def _ensure_model(self) -> None:
         if self._session is not None:
             return
         import onnxruntime as ort
-
         model_dir = Path.home() / ".facetrack" / "models"
         model_dir.mkdir(parents=True, exist_ok=True)
         model_path = model_dir / "MiniFASNetV2.onnx"
@@ -172,17 +143,12 @@ class LivenessGuard:
                 temp_path.unlink(missing_ok=True)
                 raise RuntimeError("Downloaded anti-spoofing model failed its integrity check.")
             temp_path.replace(model_path)
-
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._session = ort.InferenceSession(
-            model_path.as_posix(),
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
+        self._session = ort.InferenceSession(model_path.as_posix(), sess_options=options, providers=["CPUExecutionProvider"])
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
@@ -196,7 +162,7 @@ class LivenessGuard:
                 digest.update(chunk)
         return digest.hexdigest() == MODEL_SHA256
 
-    def _update_ai_spoof(self, crop: np.ndarray) -> None:
+    def _update_ai_spoof(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> None:
         now = time.monotonic()
         if now - self._last_ai_check < self.spoof_refresh:
             return
@@ -204,25 +170,44 @@ class LivenessGuard:
         self._ai_error = None
         try:
             self._ensure_model()
-            assert self._session is not None
-            assert self._input_name is not None
-            assert self._output_name is not None
-            face = cv2.resize(crop, MODEL_SIZE, interpolation=cv2.INTER_LINEAR)
-            # MiniFASNetV2 expects BGR float32 pixels normalized to [0, 1].
-            tensor = np.transpose(face.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
+            assert self._session is not None and self._input_name is not None and self._output_name is not None
+            top, right, bottom, left = location
+            src_h, src_w = frame.shape[:2]
+            box_w = max(1, right - left)
+            box_h = max(1, bottom - top)
+            # Match the upstream MiniFASNetV2 inference exactly: scale is capped
+            # by the available image area, then resize to the model input.
+            scale = min((src_h - 1) / box_h, (src_w - 1) / box_w, 2.7)
+            new_w = box_w * scale
+            new_h = box_h * scale
+            center_x = left + box_w / 2.0
+            center_y = top + box_h / 2.0
+            x1 = max(0, int(center_x - new_w / 2.0))
+            y1 = max(0, int(center_y - new_h / 2.0))
+            x2 = min(src_w - 1, int(center_x + new_w / 2.0))
+            y2 = min(src_h - 1, int(center_y + new_h / 2.0))
+            cropped = frame[y1:y2 + 1, x1:x2 + 1]
+            if cropped.size == 0:
+                self._last_ai_real = False
+                self._live_confirmations = 0
+                return
+            input_cfg = self._session.get_inputs()[0]
+            input_size = tuple(input_cfg.shape[2:])
+            face = cv2.resize(cropped, input_size[::-1], interpolation=cv2.INTER_LINEAR)
+            # The upstream model expects raw BGR float32 values, NOT /255 normalization.
+            tensor = np.transpose(face.astype(np.float32), (2, 0, 1))[None, ...]
             logits = np.asarray(self._session.run([self._output_name], {self._input_name: tensor})[0], dtype=np.float32)
             logits -= np.max(logits, axis=1, keepdims=True)
             probabilities = np.exp(logits)
             probabilities /= np.sum(probabilities, axis=1, keepdims=True)
-            # MiniFASNetV2 classes are [print/spoof, live, replay/spoof].
-            live_score = float(probabilities[0, 1])
-            self._last_ai_score = live_score
-            if live_score >= 0.80:
+            label_idx = int(np.argmax(probabilities[0]))
+            score = float(probabilities[0, label_idx])
+            self._last_ai_score = float(probabilities[0, 1])
+            self._last_ai_real = label_idx == 1 and score >= 0.65
+            if self._last_ai_real:
                 self._live_confirmations += 1
-                self._last_ai_real = True
             else:
                 self._live_confirmations = 0
-                self._last_ai_real = False
         except Exception as error:
             self._last_ai_real = False
             self._live_confirmations = 0
@@ -238,8 +223,7 @@ class LivenessGuard:
         if not landmarks:
             return
         eyes = landmarks[0]
-        left_eye = eyes.get("left_eye")
-        right_eye = eyes.get("right_eye")
+        left_eye = eyes.get("left_eye"); right_eye = eyes.get("right_eye")
         if not left_eye or not right_eye:
             return
         ear = (self._eye_aspect_ratio(left_eye) + self._eye_aspect_ratio(right_eye)) / 2.0
