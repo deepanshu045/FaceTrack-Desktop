@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -69,7 +71,10 @@ class AttendanceRepository:
         self._college_id = 0
         self._recognition_settings = RecognitionSettings(85, 0.60, True)
         self._students: list[RegisteredStudent] = []
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
         self._resolve_college()
+        self._start_heartbeat()
 
     def _resolve_college(self) -> None:
         if not self._access_code:
@@ -106,6 +111,35 @@ class AttendanceRepository:
         self._students = students
         if not self._students:
             raise RuntimeError("No registered face encodings were found for this college.")
+
+    def _start_heartbeat(self) -> None:
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name="facetrack-desktop-heartbeat",
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.is_set():
+            try:
+                _request_json(
+                    "post",
+                    "/recognition/desktop-heartbeat",
+                    json={"access_code": self._access_code},
+                )
+            except Exception:
+                # Attendance must continue to work even when the status endpoint
+                # is temporarily unavailable. The next heartbeat will retry.
+                pass
+            self._heartbeat_stop.wait(10)
+
+    def stop_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
 
     @property
     def college_slug(self) -> str:
