@@ -6,7 +6,6 @@ import ctypes
 import sys
 import time
 
-# Make Tkinter render at native Windows DPI instead of bitmap-scaling the app.
 if sys.platform == "win32":
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -27,7 +26,7 @@ import face_recognition
 import numpy as np
 from PIL import Image, ImageTk
 
-from backend_bridge import AttendanceRepository, RecognitionSettings, RegisteredStudent
+from backend_bridge import ActiveLecture, AttendanceRepository, RecognitionSettings, RegisteredStudent
 from liveness import LivenessGuard
 
 
@@ -54,6 +53,7 @@ class FaceAttendanceApp(tk.Tk):
         self.scan_token = 0
         self.repository: AttendanceRepository | None = None
         self.students: list[RegisteredStudent] = []
+        self.active_lecture: ActiveLecture | None = None
         self.last_match_id: int | None = None
         self.last_match_at = 0.0
         self.running = False
@@ -66,6 +66,7 @@ class FaceAttendanceApp(tk.Tk):
         self.status = tk.StringVar(value="Ready to scan.")
         self.person = tk.StringVar(value="No active scan")
         self.liveness_status = tk.StringVar(value="Liveness waiting")
+        self.lecture_status = tk.StringVar(value="Checking active lecture…")
         self.access_code = tk.StringVar()
         self.selected_college_slug = ""
         self._configure_styles()
@@ -124,30 +125,58 @@ class FaceAttendanceApp(tk.Tk):
         self.access_page.destroy()
         self._build_ui()
         self._apply_recognition_settings(self.settings)
+        self._refresh_active_lecture()
         self.status.set(f"{len(self.students)} registered face profiles ready.")
 
     def _load_college_data(self) -> None:
+        old_repository = self.repository
+        if old_repository is not None:
+            old_repository.stop_heartbeat()
         self.repository = AttendanceRepository(self.access_code.get())
         self.selected_college_slug = self.repository.college_slug
         self.settings = self.repository.recognition_settings()
         self.students = self.repository.students_with_faces()
+        self.active_lecture = None
         if not self.students:
             raise RuntimeError("No registered face encodings were found for this college.")
+
+    def _refresh_active_lecture(self, student_id: int | None = None) -> None:
+        if self.repository is None:
+            self.active_lecture = None
+            self.lecture_status.set("No college selected")
+            return
+        if student_id is None:
+            self.active_lecture = None
+            self.lecture_status.set("Active lecture will be identified after the student is recognized")
+            return
+        try:
+            self.active_lecture = self.repository.active_lecture_for_student(student_id)
+        except Exception as error:
+            self.active_lecture = None
+            self.lecture_status.set(f"Lecture check failed: {error}")
+            return
+        if self.active_lecture is None:
+            self.lecture_status.set("No active lecture for this student right now")
+            return
+        lecture = self.active_lecture
+        class_name = f"{lecture.class_name} {lecture.section}".strip()
+        self.lecture_status.set(f"{lecture.subject}  •  {class_name}  •  {lecture.start_time}–{lecture.end_time}")
 
     def _build_ui(self) -> None:
         header = tk.Frame(self, bg="#0b1321", padx=22, pady=14)
         header.pack(fill="x")
         self._label(header, "FaceTrack", 20, "bold", "#f4f7fb", "#0b1321").pack(side="left")
         self._label(header, "LIVE ATTENDANCE", 9, "bold", "#70a8ff", "#0b1321").pack(side="left", padx=(10, 0))
+        self.change_access_button = ttk.Button(header, text="Change access code", style="Secondary.TButton", command=self._change_access_code)
+        self.change_access_button.pack(side="right", padx=(12, 0))
         self.header_status = self._label(header, "● Scanner offline", 9, "bold", "#8c9bb0", "#0b1321")
         self.header_status.pack(side="right")
         stats = tk.Frame(self, bg="#070d18", padx=20, pady=16)
         stats.pack(fill="x")
         self._stat_card(stats, "SCANNER STATUS", "Ready to start", "◉", "scanner_stat")
-        self._stat_card(stats, "TODAY PRESENT", "Attendance from this scanner", "✓", "present_stat")
+        self._stat_card(stats, "CURRENT LECTURE", "Waiting for student", "▣", "lecture_stat")
         self._stat_card(stats, "FACE PROFILES READY", str(len(self.students)), "♙", "profiles_stat")
 
-        # pady tuple belongs to pack(), not tk.Frame().
         content = tk.Frame(self, bg="#070d18", padx=20, pady=0)
         content.pack(fill="both", expand=True, pady=(0, 20))
 
@@ -179,12 +208,13 @@ class FaceAttendanceApp(tk.Tk):
         right.pack_propagate(False)
         self._label(right, "Live Verification", 16, "bold").pack(anchor="w")
         self._label(right, "Recognition only succeeds after liveness.", 9, fg="#8ea0b9").pack(anchor="w", pady=(3, 18))
+        self._verification_pill(right, "CURRENT LECTURE", self.lecture_status)
         self._verification_pill(right, "LIVENESS", self.liveness_status)
         self._verification_pill(right, "IDENTITY", self.person)
         rules = self._card(right, bg="#0e1727", padx=14, pady=14)
         rules.pack(fill="x", pady=(18, 14))
         self._label(rules, "SECURITY CHECKS", 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
-        for text in ("One face only", "AI anti-spoofing required", "Blink challenge required", "Registered student required", "Attendance once per day"):
+        for text in ("One face only", "AI anti-spoofing required", "Blink challenge required", "Registered student required", "Attendance only during active lecture"):
             self._label(rules, "•  " + text, 9, fg="#c7d4e5", bg="#0e1727").pack(anchor="w", pady=3)
         settings = self._card(right, bg="#0e1727", padx=14, pady=14)
         settings.pack(fill="x")
@@ -216,6 +246,19 @@ class FaceAttendanceApp(tk.Tk):
         self._label(box, title, 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
         self._label(box, "", 10, "bold", "#dce7f5", "#0e1727", textvariable=variable, wraplength=270, justify="left").pack(anchor="w", pady=(5, 0))
 
+    def _change_access_code(self) -> None:
+        self.stop()
+        if self.repository is not None:
+            self.repository.stop_heartbeat()
+            self.repository = None
+        for child in self.winfo_children():
+            child.destroy()
+        self.active_lecture = None
+        self.students = []
+        self.access_code.set("")
+        self.status.set("Ready to scan.")
+        self._build_college_access_page()
+
     def start(self) -> None:
         self.stop()
         try:
@@ -235,6 +278,9 @@ class FaceAttendanceApp(tk.Tk):
             self.liveness.reset()
             self.latest_recognition = None
             self.next_recognition_at = 0.0
+            self.active_lecture = None
+            self.lecture_status.set("Recognize a student to identify their active lecture")
+            self.lecture_stat.configure(text="Waiting for student")
             self.liveness_status.set("Live face check + blink required")
             self.person.set("Face not verified")
             self.header_status.configure(text="● Scanner active", fg="#22c995")
@@ -402,11 +448,20 @@ class FaceAttendanceApp(tk.Tk):
         if student.id != self.last_match_id or now - self.last_match_at > 5:
             self.last_match_id, self.last_match_at = student.id, now
             try:
-                created = self.repository.mark_present(student.id) if self.repository else False
-                result = "Attendance marked" if created else "Already marked today"
-                self.status.set(f"{result}: {student.name}")
-                if self.sound_enabled.get():
-                    self._play_recognition_sound()
+                self._refresh_active_lecture(student.id)
+                if self.active_lecture is None:
+                    self.lecture_stat.configure(text="Attendance closed")
+                    self.status.set(f"Recognized {student.name}, but there is no active lecture for this student.")
+                    return
+                lecture = self.active_lecture
+                self.lecture_stat.configure(text=f"{lecture.subject} • {lecture.start_time}–{lecture.end_time}")
+                result = self.repository.mark_present(student.id, lecture.id) if self.repository else {}
+                if result.get("already_marked"):
+                    self.status.set(f"Already marked for {lecture.subject}: {student.name}")
+                else:
+                    self.status.set(f"Attendance marked for {lecture.subject}: {student.name}")
+                    if self.sound_enabled.get():
+                        self._play_recognition_sound()
             except Exception as error:
                 self.status.set(f"Recognized {student.name}, but attendance failed: {error}")
 
@@ -432,6 +487,8 @@ class FaceAttendanceApp(tk.Tk):
 
     def close(self) -> None:
         self.stop()
+        if self.repository is not None:
+            self.repository.stop_heartbeat()
         self.recognizer.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 
