@@ -1,8 +1,21 @@
-"""FaceTrack Live - a one-person live face-attendance desktop application."""
+"""FaceTrack Live - live face attendance with anti-spoofing and liveness."""
 
 from __future__ import annotations
 
+import ctypes
+import sys
 import time
+
+# Make Tkinter render at native Windows DPI instead of bitmap-scaling the app.
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except (AttributeError, OSError):
+            pass
+
 import tkinter as tk
 import winsound
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -15,80 +28,92 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from backend_bridge import AttendanceRepository, RecognitionSettings, RegisteredStudent
+from liveness import LivenessGuard
 
 
 RESOLUTIONS = {"480p": (640, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
+RecognitionResult = tuple[list[tuple[int, int, int, int]], int | None, float | None, bool, str]
 
 
 class FaceAttendanceApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("FaceTrack Live Attendance")
-        self.geometry("1180x760")
-        self.minsize(980, 650)
-        self.configure(bg="#101820")
-
+        self.geometry("1240x820")
+        self.minsize(1080, 700)
+        self.configure(bg="#070d18")
         self.camera: cv2.VideoCapture | None = None
         self.capture_thread: Thread | None = None
         self.capture_stop = Event()
         self.frame_lock = Lock()
         self.latest_frame: np.ndarray | None = None
         self.recognizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-recognition")
-        self.recognition_future: Future[tuple[list[tuple[int, int, int, int]], int | None, float | None]] | None = None
+        self.recognition_future: Future[RecognitionResult] | None = None
         self.next_recognition_at = 0.0
-        self.latest_recognition: tuple[list[tuple[int, int, int, int]], int | None, float | None] | None = None
+        self.latest_recognition: RecognitionResult | None = None
         self.scan_token = 0
         self.repository: AttendanceRepository | None = None
         self.students: list[RegisteredStudent] = []
         self.last_match_id: int | None = None
         self.last_match_at = 0.0
         self.running = False
-
+        self.liveness = LivenessGuard()
         self.camera_index = tk.IntVar(value=0)
-        self.resolution = tk.StringVar(value="720p")
+        self.resolution = tk.StringVar(value="480p")
         self.target_fps = tk.StringVar(value="30")
         self.threshold = tk.DoubleVar(value=0.50)
         self.sound_enabled = tk.BooleanVar(value=True)
-        self.status = tk.StringVar(value="Ready. Start scanning when the camera is available.")
-        self.person = tk.StringVar(value="No face detected")
-        self.lecture = tk.StringVar(value="No active lecture")
+        self.status = tk.StringVar(value="Ready to scan.")
+        self.person = tk.StringVar(value="No active scan")
+        self.liveness_status = tk.StringVar(value="Liveness waiting")
         self.access_code = tk.StringVar()
         self.selected_college_slug = ""
+        self._configure_styles()
         self._build_college_access_page()
         self.protocol("WM_DELETE_WINDOW", self.close)
 
-    def _build_college_access_page(self) -> None:
+    def _configure_styles(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(
-            "College.TCombobox",
-            foreground="#111827",
-            fieldbackground="#ffffff",
-            background="#ffffff",
-            selectforeground="#111827",
-            selectbackground="#dbeafe",
-        )
-        self.access_page = tk.Frame(self, bg="#101820", padx=32, pady=32)
-        self.access_page.pack(fill="both", expand=True)
-        card = tk.Frame(self.access_page, bg="#17232e", padx=36, pady=32)
-        card.place(relx=0.5, rely=0.5, anchor="center", width=520, height=390)
-        tk.Label(card, text="FaceTrack Live", font=("Segoe UI", 24, "bold"), bg="#17232e", fg="white").pack(pady=(0, 8))
-        tk.Label(card, text="Enter the camera access code to continue", font=("Segoe UI", 11), bg="#17232e", fg="#cbd5e1").pack(pady=(0, 28))
-        tk.Label(card, text="Camera access code", anchor="w", bg="#17232e", fg="#dbeafe").pack(fill="x")
-        ttk.Entry(card, textvariable=self.access_code, show="•", font=("Segoe UI", 12)).pack(fill="x", pady=(6, 22), ipady=4)
-        buttons = tk.Frame(card, bg="#17232e")
-        buttons.pack(fill="x")
-        self.continue_button = ttk.Button(buttons, text="Continue to camera", command=self._open_camera_page)
-        self.continue_button.pack(side="right")
-        self.access_status = tk.StringVar(value="The code determines which college is used.")
-        tk.Label(card, textvariable=self.access_status, wraplength=440, justify="left", bg="#17232e", fg="#94a3b8").pack(fill="x", pady=(24, 0))
+        style.configure("Dark.TCombobox", foreground="#e6edf7", fieldbackground="#0e1727", background="#0e1727", bordercolor="#2a3950", lightcolor="#0e1727", darkcolor="#0e1727", selectforeground="#ffffff", selectbackground="#2455a6", arrowcolor="#9fb1c8")
+        style.configure("Blue.TButton", foreground="#ffffff", background="#2457c5", borderwidth=0, padding=(15, 9), font=("Segoe UI", 10, "bold"))
+        style.map("Blue.TButton", background=[("active", "#2e6ce6")])
+        style.configure("Secondary.TButton", foreground="#dbe7f5", background="#263449", borderwidth=0, padding=(13, 9), font=("Segoe UI", 10, "bold"))
+        style.map("Secondary.TButton", background=[("active", "#31425b")])
+
+    @staticmethod
+    def _label(parent, text="", size=10, weight="normal", fg="#dbe7f5", bg="#172234", **kwargs):
+        return tk.Label(parent, text=text, font=("Segoe UI", size, weight), fg=fg, bg=bg, **kwargs)
+
+    def _card(self, parent, bg="#172234", padx=20, pady=18):
+        return tk.Frame(parent, bg=bg, highlightbackground="#27364c", highlightthickness=1, padx=padx, pady=pady)
+
+    def _build_college_access_page(self) -> None:
+        page = tk.Frame(self, bg="#070d18")
+        page.pack(fill="both", expand=True)
+        self.access_page = page
+        top = tk.Frame(page, bg="#070d18", padx=34, pady=26)
+        top.pack(fill="x")
+        self._label(top, "FaceTrack", 22, "bold", "#f5f8fd", "#070d18").pack(side="left")
+        self._label(top, "LIVE ATTENDANCE", 9, "bold", "#6ea8ff", "#070d18").pack(side="left", padx=12)
+        card = self._card(page, bg="#172234", padx=42, pady=36)
+        card.place(relx=0.5, rely=0.50, anchor="center", width=520, height=390)
+        self._label(card, "Camera access", 25, "bold", "#f5f8fd").pack(anchor="w")
+        self._label(card, "Connect this scanner to the correct college workspace.", 10, fg="#91a1b8").pack(anchor="w", pady=(6, 30))
+        self._label(card, "ACCESS CODE", 9, "bold", "#7f94b1").pack(anchor="w")
+        entry = tk.Entry(card, textvariable=self.access_code, show="•", bg="#0e1727", fg="#eef5ff", insertbackground="#eef5ff", relief="flat", font=("Segoe UI", 13), bd=0)
+        entry.pack(fill="x", ipady=11, pady=(7, 20))
+        self.continue_button = ttk.Button(card, text="Continue to scanner", style="Blue.TButton", command=self._open_camera_page)
+        self.continue_button.pack(fill="x")
+        self.access_status = tk.StringVar(value="The access code determines which college is used.")
+        tk.Label(card, textvariable=self.access_status, font=("Segoe UI", 9), fg="#8292aa", bg="#172234", wraplength=420, justify="left").pack(anchor="w", pady=(18, 0))
 
     def _open_camera_page(self) -> None:
         if not self.access_code.get().strip():
             messagebox.showerror("Access code required", "Enter the camera access code for this college.")
             return
         self.continue_button.configure(state="disabled")
-        self.access_status.set("Checking access code and loading college data…")
+        self.access_status.set("Checking access code and loading face profiles…")
         self.update_idletasks()
         try:
             self._load_college_data()
@@ -99,12 +124,9 @@ class FaceAttendanceApp(tk.Tk):
         self.access_page.destroy()
         self._build_ui()
         self._apply_recognition_settings(self.settings)
-        self.status.set(
-            f"Loaded {len(self.students)} registered face(s) for {self.selected_college_slug}. Start the camera when ready."
-        )
+        self.status.set(f"{len(self.students)} registered face profiles ready.")
 
     def _load_college_data(self) -> None:
-        """Validate the access code before exposing or loading college data."""
         self.repository = AttendanceRepository(self.access_code.get())
         self.selected_college_slug = self.repository.college_slug
         self.settings = self.repository.recognition_settings()
@@ -113,46 +135,92 @@ class FaceAttendanceApp(tk.Tk):
             raise RuntimeError("No registered face encodings were found for this college.")
 
     def _build_ui(self) -> None:
-        controls = tk.Frame(self, bg="#17232e", padx=16, pady=14)
-        controls.pack(fill="x")
-        ttk.Style(self).theme_use("clam")
-        for label, variable, values, width in (
-            ("Camera", self.camera_index, (0, 1, 2, 3), 6),
-            ("Quality", self.resolution, tuple(RESOLUTIONS), 8),
-            ("FPS", self.target_fps, ("15", "24", "30", "60"), 6),
-        ):
-            tk.Label(controls, text=label, bg="#17232e", fg="#dbeafe").pack(side="left", padx=(0, 5))
-            ttk.Combobox(controls, textvariable=variable, values=values, width=width, state="readonly").pack(side="left", padx=(0, 14))
+        header = tk.Frame(self, bg="#0b1321", padx=22, pady=14)
+        header.pack(fill="x")
+        self._label(header, "FaceTrack", 20, "bold", "#f4f7fb", "#0b1321").pack(side="left")
+        self._label(header, "LIVE ATTENDANCE", 9, "bold", "#70a8ff", "#0b1321").pack(side="left", padx=(10, 0))
+        self.header_status = self._label(header, "● Scanner offline", 9, "bold", "#8c9bb0", "#0b1321")
+        self.header_status.pack(side="right")
+        stats = tk.Frame(self, bg="#070d18", padx=20, pady=16)
+        stats.pack(fill="x")
+        self._stat_card(stats, "SCANNER STATUS", "Ready to start", "◉", "scanner_stat")
+        self._stat_card(stats, "TODAY PRESENT", "Attendance from this scanner", "✓", "present_stat")
+        self._stat_card(stats, "FACE PROFILES READY", str(len(self.students)), "♙", "profiles_stat")
 
-        tk.Label(controls, text="Recognition threshold", bg="#17232e", fg="#dbeafe").pack(side="left", padx=(0, 6))
-        self.threshold_label = tk.Label(controls, text="Dashboard setting", bg="#17232e", fg="#dbeafe", width=22)
-        self.threshold_label.pack(side="left", padx=(5, 14))
-        self.sound_label = tk.Label(controls, text="Sound: dashboard setting", bg="#17232e", fg="#dbeafe")
-        self.sound_label.pack(side="left", padx=(0, 14))
-        ttk.Button(controls, text="Start camera", command=self.start).pack(side="left", padx=4)
-        ttk.Button(controls, text="Stop", command=self.stop).pack(side="left", padx=4)
+        # pady tuple belongs to pack(), not tk.Frame().
+        content = tk.Frame(self, bg="#070d18", padx=20, pady=0)
+        content.pack(fill="both", expand=True, pady=(0, 20))
 
-        body = tk.Frame(self, bg="#101820", padx=16, pady=16)
-        body.pack(fill="both", expand=True)
-        self.video_label = tk.Label(body, text="Camera preview", bg="#050a0f", fg="#9ca3af", font=("Segoe UI", 18), anchor="center")
-        self.video_label.pack(side="left", fill="both", expand=True)
-        info = tk.Frame(body, bg="#17232e", width=280, padx=18, pady=20)
-        info.pack(side="right", fill="y", padx=(16, 0))
-        info.pack_propagate(False)
-        tk.Label(info, text="LIVE LECTURE", font=("Segoe UI", 12, "bold"), bg="#17232e", fg="#60a5fa").pack(anchor="w")
-        tk.Label(info, textvariable=self.lecture, justify="left", wraplength=240, font=("Segoe UI", 14, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(10, 22))
-        tk.Label(info, text="STUDENT", font=("Segoe UI", 10, "bold"), bg="#17232e", fg="#94a3b8").pack(anchor="w")
-        tk.Label(info, textvariable=self.person, justify="left", wraplength=240, font=("Segoe UI", 15, "bold"), bg="#17232e", fg="white").pack(anchor="w", pady=(6, 20))
-        tk.Label(info, text="Rules", font=("Segoe UI", 11, "bold"), bg="#17232e", fg="white").pack(anchor="w")
-        tk.Label(info, text="• One face only\n• Match must be a registered student\n• One attendance record per lecture", justify="left", bg="#17232e", fg="#cbd5e1").pack(anchor="w", pady=(8, 22))
-        tk.Label(self, textvariable=self.status, anchor="w", padx=16, pady=10, bg="#0b1118", fg="#cbd5e1").pack(fill="x")
+        left = self._card(content, bg="#172234", padx=22, pady=18)
+        left.pack(side="left", fill="both", expand=True)
+        title_row = tk.Frame(left, bg="#172234")
+        title_row.pack(fill="x")
+        title = tk.Frame(title_row, bg="#172234")
+        title.pack(side="left")
+        self._label(title, "Camera Scanner", 16, "bold").pack(anchor="w")
+        self._label(title, "Keep exactly one registered face inside the guide.", 9, fg="#8ea0b9").pack(anchor="w", pady=(3, 0))
+        self.start_button = ttk.Button(title_row, text="▣  Start Camera", style="Blue.TButton", command=self.start)
+        self.start_button.pack(side="right")
+        camera_shell = tk.Frame(left, bg="#03070d", highlightbackground="#1d2b40", highlightthickness=1)
+        camera_shell.pack(fill="both", expand=True, pady=(18, 14))
+        self.video_label = tk.Label(camera_shell, text="Camera is stopped", bg="#03070d", fg="#73849d", font=("Segoe UI", 13), anchor="center")
+        self.video_label.pack(fill="both", expand=True)
+        control = tk.Frame(left, bg="#172234")
+        control.pack(fill="x")
+        self._label(control, "QUALITY", 8, "bold", "#7589a5").pack(side="left")
+        ttk.Combobox(control, textvariable=self.resolution, values=tuple(RESOLUTIONS), width=7, state="readonly", style="Dark.TCombobox").pack(side="left", padx=(7, 16))
+        self._label(control, "FPS", 8, "bold", "#7589a5").pack(side="left")
+        ttk.Combobox(control, textvariable=self.target_fps, values=("15", "24", "30", "60"), width=5, state="readonly", style="Dark.TCombobox").pack(side="left", padx=(7, 16))
+        ttk.Button(control, text="Stop", style="Secondary.TButton", command=self.stop).pack(side="right")
+
+        right = self._card(content, bg="#172234", padx=22, pady=18)
+        right.configure(width=330)
+        right.pack(side="right", fill="y", padx=(16, 0))
+        right.pack_propagate(False)
+        self._label(right, "Live Verification", 16, "bold").pack(anchor="w")
+        self._label(right, "Recognition only succeeds after liveness.", 9, fg="#8ea0b9").pack(anchor="w", pady=(3, 18))
+        self._verification_pill(right, "LIVENESS", self.liveness_status)
+        self._verification_pill(right, "IDENTITY", self.person)
+        rules = self._card(right, bg="#0e1727", padx=14, pady=14)
+        rules.pack(fill="x", pady=(18, 14))
+        self._label(rules, "SECURITY CHECKS", 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
+        for text in ("One face only", "AI anti-spoofing required", "Blink challenge required", "Registered student required", "Attendance once per day"):
+            self._label(rules, "•  " + text, 9, fg="#c7d4e5", bg="#0e1727").pack(anchor="w", pady=3)
+        settings = self._card(right, bg="#0e1727", padx=14, pady=14)
+        settings.pack(fill="x")
+        self._label(settings, "SCANNER SETTINGS", 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
+        self.threshold_label = self._label(settings, "Dashboard threshold", 9, fg="#d7e3f1", bg="#0e1727")
+        self.threshold_label.pack(anchor="w", pady=(8, 2))
+        self.sound_label = self._label(settings, "Sound: dashboard setting", 9, fg="#8b9db6", bg="#0e1727")
+        self.sound_label.pack(anchor="w")
+        footer = tk.Frame(self, bg="#0b1321", padx=20, pady=10)
+        footer.pack(fill="x")
+        tk.Label(footer, textvariable=self.status, anchor="w", bg="#0b1321", fg="#91a1b8", font=("Segoe UI", 9)).pack(fill="x")
+
+    def _stat_card(self, parent, title, value, icon, attr) -> None:
+        card = tk.Frame(parent, bg="#172234", highlightbackground="#27364c", highlightthickness=1, height=76)
+        card.pack(side="left", fill="x", expand=True, padx=5)
+        card.pack_propagate(False)
+        bubble = tk.Label(card, text=icon, bg="#10223b", fg="#4f94ff", font=("Segoe UI", 13, "bold"), width=3, height=1)
+        bubble.pack(side="left", padx=(12, 10), pady=14)
+        body = tk.Frame(card, bg="#172234")
+        body.pack(side="left", fill="both", expand=True, pady=11)
+        self._label(body, title, 8, "bold", "#7186a2").pack(anchor="w")
+        label = self._label(body, value, 11, "bold", "#edf3fb")
+        label.pack(anchor="w", pady=(3, 0))
+        setattr(self, attr, label)
+
+    def _verification_pill(self, parent, title, variable) -> None:
+        box = tk.Frame(parent, bg="#0e1727", highlightbackground="#26364d", highlightthickness=1, padx=12, pady=11)
+        box.pack(fill="x", pady=5)
+        self._label(box, title, 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
+        self._label(box, "", 10, "bold", "#dce7f5", "#0e1727", textvariable=variable, wraplength=270, justify="left").pack(anchor="w", pady=(5, 0))
 
     def start(self) -> None:
         self.stop()
         try:
             self._load_college_data()
             self._apply_recognition_settings(self.settings)
-            self.lecture.set("Waiting for a recognized student…")
             self.camera = cv2.VideoCapture(self.camera_index.get(), cv2.CAP_DSHOW)
             width, height = RESOLUTIONS[self.resolution.get()]
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -164,13 +232,17 @@ class FaceAttendanceApp(tk.Tk):
             self.running = True
             self.scan_token += 1
             self.capture_stop.clear()
-            with self.frame_lock:
-                self.latest_frame = None
+            self.liveness.reset()
             self.latest_recognition = None
             self.next_recognition_at = 0.0
+            self.liveness_status.set("Live face check + blink required")
+            self.person.set("Face not verified")
+            self.header_status.configure(text="● Scanner active", fg="#22c995")
+            self.scanner_stat.configure(text="Active scanning")
+            self.start_button.configure(text="▣  Camera Active")
             self.capture_thread = Thread(target=self._capture_loop, args=(self.camera,), daemon=True)
             self.capture_thread.start()
-            self.status.set(f"Scanning {self.selected_college_slug} with {len(self.students)} registered face(s) at {self.settings.confidence_threshold}% confidence.")
+            self.status.set("Scanning. Keep exactly one face inside the guide and blink once.")
             self._next_frame()
         except Exception as error:
             self.stop()
@@ -189,10 +261,20 @@ class FaceAttendanceApp(tk.Tk):
         with self.frame_lock:
             self.latest_frame = None
         self.latest_recognition = None
-        self.status.set("Camera stopped.")
+        if hasattr(self, "liveness_status"):
+            self.liveness_status.set("Waiting for camera")
+        if hasattr(self, "person"):
+            self.person.set("No active scan")
+        if hasattr(self, "header_status"):
+            self.header_status.configure(text="● Scanner offline", fg="#8c9bb0")
+        if hasattr(self, "scanner_stat"):
+            self.scanner_stat.configure(text="Ready to start")
+        if hasattr(self, "start_button"):
+            self.start_button.configure(text="▣  Start Camera")
+        if hasattr(self, "status"):
+            self.status.set("Camera stopped.")
 
     def _capture_loop(self, camera: cv2.VideoCapture) -> None:
-        """Continuously retain only the newest camera frame in a background thread."""
         while not self.capture_stop.is_set() and camera.isOpened():
             ok, frame = camera.read()
             if not ok:
@@ -210,19 +292,24 @@ class FaceAttendanceApp(tk.Tk):
             return
         self._collect_recognition()
         self._draw_latest_recognition(frame)
-        self._schedule_recognition(frame)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        preview_frame = frame
+        max_width, max_height = 900, 600
+        height, width = frame.shape[:2]
+        scale = min(max_width / width, max_height / height, 1.0)
+        if scale < 1.0:
+            preview_frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
-        image.thumbnail((850, 640))
         preview = ImageTk.PhotoImage(image=image)
         self.video_label.configure(image=preview, text="")
         self.video_label.image = preview
+        self._schedule_recognition(frame)
         self.after(max(1, round(1000 / int(self.target_fps.get()))), self._next_frame)
 
     def _schedule_recognition(self, frame: np.ndarray) -> None:
         if self.recognition_future is not None or time.monotonic() < self.next_recognition_at:
             return
-        self.next_recognition_at = time.monotonic() + 0.20
+        self.next_recognition_at = time.monotonic() + 0.50
         token = self.scan_token
         students = self.students
         threshold = self.threshold.get()
@@ -242,31 +329,43 @@ class FaceAttendanceApp(tk.Tk):
             return
         self._update_recognition_status()
 
-    @staticmethod
-    def _recognize(
-        frame: np.ndarray, students: list[RegisteredStudent], threshold: float
-    ) -> tuple[list[tuple[int, int, int, int]], int | None, float | None]:
-        small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-        locations = face_recognition.face_locations(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), model="hog")
+    def _recognize(self, frame: np.ndarray, students: list[RegisteredStudent], threshold: float) -> RecognitionResult:
+        small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+        rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        locations = face_recognition.face_locations(rgb_small, model="hog")
         if len(locations) != 1:
-            return locations, None, None
-
-        encoding = face_recognition.face_encodings(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), locations)[0]
+            if not locations:
+                missing = self.liveness.evaluate_missing_face(frame)
+                recent = self.liveness.recent_face_location
+                if recent is not None:
+                    cached = tuple(max(0, int(value / 4)) for value in recent)
+                    return [cached], None, None, False, missing.message
+                return [], None, None, False, missing.message
+            self.liveness.reset()
+            return locations, None, None, False, "Only one person may be in frame"
+        full_location = tuple(value * 4 for value in locations[0])
+        live = self.liveness.evaluate(frame, full_location)
+        if not live.allowed:
+            return locations, None, None, False, live.message
+        encoding = face_recognition.face_encodings(rgb_small, locations)[0]
         distances = face_recognition.face_distance([s.encoding for s in students], encoding)
         match_index = int(np.argmin(distances))
         distance = float(distances[match_index])
-        return locations, match_index if distance <= threshold else None, distance
+        return locations, match_index if distance <= threshold else None, distance, True, live.message
 
     def _draw_latest_recognition(self, frame: np.ndarray) -> None:
         if self.latest_recognition is None:
+            h, w = frame.shape[:2]
+            cv2.ellipse(frame, (w // 2, h // 2), (max(90, w // 8), max(120, h // 4)), 0, 0, 360, (80, 130, 210), 2)
             return
-        locations, match_index, distance = self.latest_recognition
+        locations, match_index, distance, live_ok, message = self.latest_recognition
         if len(locations) != 1:
-            for top, right, bottom, left in locations:
-                cv2.rectangle(frame, (left * 4, top * 4), (right * 4, bottom * 4), (0, 165, 255), 3)
             return
         top, right, bottom, left = locations[0]
         box = (left * 4, top * 4, right * 4, bottom * 4)
+        if not live_ok:
+            self._draw_box(frame, box, "LIVENESS REQUIRED", (0, 165, 255))
+            return
         if match_index is None:
             self._draw_box(frame, box, "UNKNOWN", (0, 0, 255))
             return
@@ -276,37 +375,35 @@ class FaceAttendanceApp(tk.Tk):
     def _update_recognition_status(self) -> None:
         if self.latest_recognition is None:
             return
-        locations, match_index, distance = self.latest_recognition
+        locations, match_index, distance, live_ok, message = self.latest_recognition
+        self.liveness_status.set("Verified ✓" if live_ok else message)
         if len(locations) != 1:
             text = "No face detected" if not locations else "Only one person may be in frame"
             self.person.set(text)
             self.status.set(text)
             return
-        if match_index is None:
-            self.person.set(f"Unknown face\nDistance: {distance:.3f}")
-            self.status.set("Face is not registered or is below the selected confidence.")
+        if not live_ok:
+            self.person.set("Face detected • Attendance locked")
+            self.status.set(message)
             return
-
+        if match_index is None:
+            if distance is None:
+                self.person.set("Blink verified • Face reacquiring…")
+                self.status.set(message)
+                return
+            self.person.set(f"Unknown face • distance {distance:.3f}")
+            self.status.set("Live face verified, but the face is not registered.")
+            return
         student = self.students[match_index]
-        self.person.set(f"{student.name}\n{student.roll_no}\n{student.department}\nMatch distance: {distance:.3f}")
+        self.person.set(f"{student.name} • {student.roll_no}")
+        self.status.set(f"Live face verified: {student.name}")
+        self.scanner_stat.configure(text="Face verified")
         now = time.monotonic()
         if student.id != self.last_match_id or now - self.last_match_at > 5:
             self.last_match_id, self.last_match_at = student.id, now
             try:
-                payload = self.repository.mark_present(student.id) if self.repository else {}
-                lecture = payload.get("lecture") or {}
-                subject = lecture.get("subject")
-                start_time = lecture.get("start_time", "")[:5]
-                end_time = lecture.get("end_time", "")[:5]
-                if subject:
-                    self.lecture.set(f"{subject}\n{start_time} – {end_time}")
-
-                if payload.get("already_marked"):
-                    result = "Attendance already marked for this lecture"
-                elif payload.get("attendance_marked"):
-                    result = "Attendance marked for this lecture"
-                else:
-                    result = payload.get("message", "Attendance status unavailable")
+                created = self.repository.mark_present(student.id) if self.repository else False
+                result = "Attendance marked" if created else "Already marked today"
                 self.status.set(f"{result}: {student.name}")
                 if self.sound_enabled.get():
                     self._play_recognition_sound()
@@ -323,16 +420,11 @@ class FaceAttendanceApp(tk.Tk):
     def _apply_recognition_settings(self, settings: RecognitionSettings) -> None:
         self.threshold.set(settings.distance_threshold)
         self.sound_enabled.set(settings.sound_alerts)
-        self.threshold_label.configure(
-            text=f"{settings.confidence_threshold}% (distance {settings.distance_threshold:.2f})"
-        )
-        self.sound_label.configure(
-            text=f"Sound: {'on' if settings.sound_alerts else 'off'} (dashboard)"
-        )
+        self.threshold_label.configure(text=f"Recognition: {settings.confidence_threshold}%  •  distance {settings.distance_threshold:.2f}")
+        self.sound_label.configure(text=f"Sound alerts: {'on' if settings.sound_alerts else 'off'}")
 
     @staticmethod
     def _play_recognition_sound() -> None:
-        """Use Windows' system sound instead of Tk's often-silent bell."""
         try:
             winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
         except RuntimeError:
