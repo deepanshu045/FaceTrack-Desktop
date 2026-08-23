@@ -36,6 +36,18 @@ class CollegeOption:
 
 
 @dataclass(frozen=True)
+class ActiveLecture:
+    id: int
+    subject: str
+    date: str
+    start_time: str
+    end_time: str
+    class_name: str
+    section: str
+    department: str
+
+
+@dataclass(frozen=True)
 class RecognitionSettings:
     confidence_threshold: int
     distance_threshold: float
@@ -167,9 +179,31 @@ class AttendanceRepository:
     def students_with_faces(self) -> list[RegisteredStudent]:
         return list(self._students)
 
-    def mark_present(self, student_id: int) -> dict:
+    def active_lecture_for_student(self, student_id: int) -> ActiveLecture | None:
+        payload = _request_json(
+            "get",
+            f"/public/college/access-code/{quote(self._access_code, safe='')}/active-lecture/{student_id}",
+        )
+        row = payload.get("lecture")
+        if not payload.get("active") or not row:
+            return None
+        return ActiveLecture(
+            id=int(row["id"]),
+            subject=str(row["subject"]),
+            date=str(row["date"]),
+            start_time=str(row["start_time"]),
+            end_time=str(row["end_time"]),
+            class_name=str(row.get("class_name") or ""),
+            section=str(row.get("section") or ""),
+            department=str(row.get("department") or ""),
+        )
+
+    def mark_present(self, student_id: int, lecture_id: int | None = None) -> dict:
+        payload = {"student_id": student_id}
+        if lecture_id is not None:
+            payload["lecture_id"] = lecture_id
         return _request_json(
             "post",
             f"/public/college/{quote(self._college_slug, safe='')}/mark-attendance",
-            json={"student_id": student_id},
+            json=payload,
         )
