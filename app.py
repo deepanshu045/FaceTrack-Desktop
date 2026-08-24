@@ -76,7 +76,7 @@ class FaceAttendanceApp(tk.Tk):
         self.selected_college_slug = ""
         self._configure_styles()
         self._build_college_access_page()
-        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
