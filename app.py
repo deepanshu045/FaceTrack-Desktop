@@ -31,7 +31,9 @@ from liveness import LivenessGuard
 
 RESOLUTIONS = {"480p": (640, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
 RECOGNITION_SCALE = 0.25
-RECOGNITION_INTERVAL = 0.50
+# Keep the preview smooth while doing expensive HOG work less often.
+RECOGNITION_INTERVAL = 0.65
+PREVIEW_INTERVAL_MS = 33
 RecognitionResult = tuple[list[tuple[int, int, int, int]], int | None, float | None, bool, str]
 
 class FaceAttendanceApp(tk.Tk):
@@ -132,6 +134,7 @@ class FaceAttendanceApp(tk.Tk):
         self._build_ui()
         self._apply_recognition_settings(self.settings)
         self._refresh_active_lecture()
+        self._refresh_cameras()
         self.status.set(f"{len(self.students)} registered face profiles ready.")
 
     def _load_college_data(self) -> None:
@@ -245,88 +248,86 @@ class FaceAttendanceApp(tk.Tk):
         settings = self._card(right, bg="#0e1727", padx=12, pady=10)
         settings.pack(fill="x")
         self._label(settings, "SCANNER SETTINGS", 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
-        self.threshold_label = self._label(settings, "Recognition: dashboard setting", 8, fg="#d7e3f1", bg="#0e1727")
-        self.threshold_label.pack(anchor="w", pady=(5, 1))
-        self.sound_label = self._label(settings, "Sound: dashboard setting", 8, fg="#8b9db6", bg="#0e1727")
-        self.sound_label.pack(anchor="w")
-        footer = tk.Frame(self, bg="#0b1321", padx=16, pady=8)
+        self.threshold_label = self._label(settings, "Recognition: --", 8, fg="#a7b6ca", bg="#0e1727")
+        self.threshold_label.pack(anchor="w", pady=(5, 0))
+        self.sound_label = self._label(settings, "Sound alerts: on", 8, fg="#a7b6ca", bg="#0e1727")
+        self.sound_label.pack(anchor="w", pady=(2, 0))
+        footer = tk.Frame(self, bg="#0b1321", padx=18, pady=8)
         footer.pack(fill="x")
-        tk.Label(footer, textvariable=self.status, anchor="w", bg="#0b1321", fg="#91a1b8", font=("Segoe UI", 9)).pack(fill="x")
-        self._refresh_cameras()
+        self._label(footer, "STATUS", 8, "bold", "#7589a5", "#0b1321").pack(side="left", padx=(0, 10))
+        self._label(footer, textvariable=self.status, 9, fg="#b9c7d9", bg="#0b1321", anchor="w").pack(side="left", fill="x", expand=True)
+
+    def _stat_card(self, parent, title: str, value: str, icon: str, attr: str) -> None:
+        card = tk.Frame(parent, bg="#172234", padx=14, pady=10, highlightbackground="#27364c", highlightthickness=1)
+        card.pack(side="left", fill="x", expand=True, padx=4)
+        self._label(card, title, 8, "bold", "#7589a5").pack(anchor="w")
+        label = self._label(card, value, 10, "bold", "#e8f0fa")
+        label.pack(anchor="w", pady=(3, 0))
+        setattr(self, attr, label)
+
+    def _verification_pill(self, parent, title: str, variable: tk.StringVar, wraplength: int = 270) -> None:
+        frame = tk.Frame(parent, bg="#0e1727", padx=12, pady=9)
+        frame.pack(fill="x", pady=4)
+        self._label(frame, title, 8, "bold", "#7589a5", "#0e1727").pack(anchor="w")
+        self._label(frame, textvariable=variable, 9, "bold", "#dce8f7", "#0e1727", wraplength=wraplength, justify="left").pack(anchor="w", pady=(4, 0))
 
     def _refresh_cameras(self) -> None:
-        if getattr(self, "running", False):
-            self.status.set("Stop the camera before refreshing the camera list.")
+        if not hasattr(self, "camera_combo"):
             return
-        previous_index = self.camera_index.get()
+        previous = self.camera_choice.get()
+        options: list[str] = []
         devices: dict[str, int] = {}
         for index in range(8):
-            capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)
             try:
-                if capture.isOpened():
-                    ok, _frame = capture.read()
+                if camera.isOpened():
+                    ok, _ = camera.read()
                     if ok:
-                        devices[f"Camera {index}"] = index
+                        name = f"Camera {index}"
+                        options.append(name)
+                        devices[name] = index
             finally:
-                capture.release()
+                camera.release()
+        self.camera_options = options
         self.camera_devices = devices
-        self.camera_options = list(devices)
-        self.camera_combo.configure(values=self.camera_options)
-        if not self.camera_options:
-            self.camera_choice.set("No camera detected")
-            self.camera_index.set(0)
-            self.status.set("No camera detected. Connect a webcam and click Refresh.")
-            return
-        selected = next((name for name, index in devices.items() if index == previous_index), self.camera_options[0])
-        self.camera_choice.set(selected)
-        self.camera_index.set(devices[selected])
-        self.status.set(f"{len(self.camera_options)} camera(s) available. Select one and start the scanner.")
+        self.camera_combo["values"] = options
+        if previous in devices:
+            self.camera_choice.set(previous)
+        elif options:
+            self.camera_choice.set(options[0])
+            self.camera_index.set(devices[options[0]])
+        else:
+            self.camera_choice.set("")
+            self.status.set("No usable camera detected.")
 
     def _on_camera_selected(self, _event=None) -> None:
         selected = self.camera_choice.get()
-        index = self.camera_devices.get(selected)
-        if index is None:
+        if selected not in self.camera_devices:
             return
-        self.camera_index.set(index)
-        self.status.set(f"Selected {selected}. Ready to start the scanner.")
+        self.camera_index.set(self.camera_devices[selected])
+        if self.running:
+            self._restart_selected_camera()
+        else:
+            self.status.set(f"Selected {selected}. Press Start Camera when ready.")
 
-    def _stat_card(self, parent, title, value, icon, attr) -> None:
-        card = tk.Frame(parent, bg="#172234", highlightbackground="#27364c", highlightthickness=1, height=70)
-        card.pack(side="left", fill="x", expand=True, padx=4)
-        card.pack_propagate(False)
-        bubble = tk.Label(card, text=icon, bg="#10223b", fg="#4f94ff", font=("Segoe UI", 12, "bold"), width=3)
-        bubble.pack(side="left", padx=(10, 8), pady=12)
-        body = tk.Frame(card, bg="#172234")
-        body.pack(side="left", fill="both", expand=True, pady=10)
-        self._label(body, title, 8, "bold", "#7186a2").pack(anchor="w")
-        label = self._label(body, value, 10, "bold", "#edf3fb")
-        label.pack(anchor="w", pady=(2, 0))
-        setattr(self, attr, label)
-
-    def _verification_pill(self, parent, title, variable, wraplength=270) -> None:
-        box = tk.Frame(parent, bg="#0e1727", highlightbackground="#26364d", highlightthickness=1, padx=10, pady=8)
-        box.pack(fill="x", pady=3)
-        self._label(box, title, 7, "bold", "#7589a5", "#0e1727").pack(anchor="w")
-        self._label(box, "", 9, "bold", "#dce7f5", "#0e1727", textvariable=variable, wraplength=wraplength, justify="left").pack(anchor="w", pady=(3, 0))
+    def _restart_selected_camera(self) -> None:
+        if not self.running:
+            return
+        self.stop()
+        self.start()
 
     def _change_access_code(self) -> None:
         self.stop()
         if self.repository is not None:
             self.repository.stop_heartbeat()
-            self.repository = None
-        for child in self.winfo_children():
-            child.destroy()
-        self.active_lecture = None
-        self.students = []
-        self.known_encodings = np.empty((0, 128), dtype=np.float64)
+        self.repository = None
         self.access_code.set("")
-        self.status.set("Ready to scan.")
         self._build_college_access_page()
 
     def start(self) -> None:
-        self.stop()
+        if self.running:
+            return
         try:
-            self._load_college_data()
             self._apply_recognition_settings(self.settings)
             selected_index = self.camera_index.get()
             if self.camera_choice.get() in self.camera_devices:
@@ -427,7 +428,7 @@ class FaceAttendanceApp(tk.Tk):
         self.video_label.configure(image=preview, text="")
         self.video_label.image = preview
         self._schedule_recognition(frame)
-        self.after(max(1, round(1000 / int(self.target_fps.get()))), self._next_frame)
+        self.after(PREVIEW_INTERVAL_MS, self._next_frame)
 
     def _schedule_recognition(self, frame: np.ndarray) -> None:
         if self.recognition_future is not None or time.monotonic() < self.next_recognition_at:
@@ -454,7 +455,6 @@ class FaceAttendanceApp(tk.Tk):
         self._update_recognition_status()
 
     def _recognize(self, frame: np.ndarray, students: list[RegisteredStudent], known_encodings: np.ndarray, threshold: float) -> RecognitionResult:
-        # HOG is CPU-heavy. Keep the detector at 25% resolution and never upsample.
         small = cv2.resize(frame, (0, 0), fx=RECOGNITION_SCALE, fy=RECOGNITION_SCALE, interpolation=cv2.INTER_AREA)
         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         locations = face_recognition.face_locations(rgb_small, number_of_times_to_upsample=0, model="hog")
@@ -475,10 +475,13 @@ class FaceAttendanceApp(tk.Tk):
         encoding = face_recognition.face_encodings(rgb_small, known_face_locations=locations, num_jitters=1, model="small")[0]
         if known_encodings.size == 0:
             return locations, None, None, True, live.message
-        distances = face_recognition.face_distance(known_encodings, encoding)
-        match_index = int(np.argmin(distances))
-        distance = float(distances[match_index])
-        return locations, match_index if distance <= threshold else None, distance, True, live.message
+        # Avoid the extra sqrt performed by face_distance; compare squared distances instead.
+        delta = known_encodings - encoding
+        squared_distances = np.einsum("ij,ij->i", delta, delta)
+        match_index = int(np.argmin(squared_distances))
+        squared_distance = float(squared_distances[match_index])
+        distance = squared_distance ** 0.5
+        return locations, match_index if squared_distance <= threshold * threshold else None, distance, True, live.message
 
     def _draw_latest_recognition(self, frame: np.ndarray) -> None:
         if self.latest_recognition is None:
