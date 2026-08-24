@@ -31,7 +31,6 @@ from liveness import LivenessGuard
 
 RESOLUTIONS = {"480p": (640, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
 RECOGNITION_SCALE = 0.25
-# Keep the preview smooth while doing expensive HOG work less often.
 RECOGNITION_INTERVAL = 0.65
 PREVIEW_INTERVAL_MS = 33
 RecognitionResult = tuple[list[tuple[int, int, int, int]], int | None, float | None, bool, str]
@@ -263,3 +262,9 @@ class FaceAttendanceApp(tk.Tk):
         self._label(card, title, 8, "bold", "#7589a5").pack(anchor="w")
         label = self._label(card, value, 10, "bold", "#e8f0fa")
         label.pack(anchor="w", pady=(3, 0))
+        setattr(self, attr, label)
+
+
+if __name__ == "__main__":
+    app = FaceAttendanceApp()
+    app.mainloop()
