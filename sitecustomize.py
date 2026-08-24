@@ -44,3 +44,35 @@ def _bind(self, sequence=None, func=None, add=None):
 
 # Allows the camera dropdown to switch cameras while the scanner is running.
 ttk.Combobox.bind = _bind
+
+
+def _facetrack_close(self) -> None:
+    """Provide the close callback expected by FaceAttendanceApp."""
+    try:
+        stop = getattr(self, "stop", None)
+        if callable(stop):
+            stop()
+    except Exception:
+        pass
+
+    try:
+        repository = getattr(self, "repository", None)
+        if repository is not None:
+            repository.stop_heartbeat()
+    except Exception:
+        pass
+
+    try:
+        recognizer = getattr(self, "recognizer", None)
+        if recognizer is not None:
+            recognizer.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+    self.destroy()
+
+
+# app.py registers WM_DELETE_WINDOW with self.close, but the fa53f7b
+# application does not define that method. Provide it before the app starts.
+if not hasattr(tk.Tk, "close"):
+    tk.Tk.close = _facetrack_close
