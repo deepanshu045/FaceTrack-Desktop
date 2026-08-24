@@ -58,9 +58,10 @@ def _api_url(path: str) -> str:
 
 def _request_json(method: str, path: str, **kwargs) -> dict:
     url = _api_url(path)
+    timeout = kwargs.pop("timeout", 5)
     logger.info("Backend request: %s %s", method.upper(), url)
     try:
-        response = requests.request(method, url, timeout=5, **kwargs)
+        response = requests.request(method, url, timeout=timeout, **kwargs)
     except requests.RequestException as exc:
         logger.error("Backend connection failed: %s", exc)
         raise RuntimeError(
@@ -99,39 +100,23 @@ class AttendanceRepository:
         self._students: list[RegisteredStudent] = []
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
-
-        # Attendance requests must never block the Tkinter recognition loop.
-        self._attendance_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="attendance-api",
-        )
+        self._attendance_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="attendance-api")
         self._attendance_lock = threading.Lock()
         self._attendance_inflight: set[tuple[int, int]] = set()
         self._attendance_last_submit: dict[tuple[int, int], float] = {}
-
-        # Cache lecture lookups so a successful face match does not have to
-        # wait for an HTTP request on the UI thread.
         self._lecture_cache: dict[int, ActiveLecture | None] = {}
         self._lecture_cache_at: dict[int, float] = {}
         self._lecture_refreshing: set[int] = set()
         self._lecture_lock = threading.Lock()
         self._lecture_cache_ttl = 3.0
-        self._lecture_refresh_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="lecture-api",
-        )
-
+        self._lecture_refresh_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lecture-api")
         self._resolve_college()
         self._start_heartbeat()
 
     def _resolve_college(self) -> None:
         if not self._access_code:
             raise RuntimeError("Enter the camera access code.")
-
-        payload = _request_json(
-            "get",
-            f"/public/college/access-code/{quote(self._access_code, safe='')}",
-        )
+        payload = _request_json("get", f"/public/college/access-code/{quote(self._access_code, safe='')}")
         self._college_slug = payload["college_slug"]
         self._college_id = int(payload["college_id"])
         settings = payload.get("recognition_settings") or {}
@@ -140,22 +125,18 @@ class AttendanceRepository:
             distance_threshold=float(settings.get("distance_threshold", 0.60)),
             sound_alerts=bool(settings.get("sound_alerts", True)),
         )
-
         students = []
         for row in payload.get("students", []):
             encoding = row.get("face_encoding")
             if not encoding:
                 continue
-            students.append(
-                RegisteredStudent(
-                    id=int(row["id"]),
-                    roll_no=str(row["roll_no"]),
-                    name=str(row["name"]),
-                    department=str(row.get("department") or "Not set"),
-                    encoding=np.asarray(encoding, dtype=np.float64),
-                )
-            )
-
+            students.append(RegisteredStudent(
+                id=int(row["id"]),
+                roll_no=str(row["roll_no"]),
+                name=str(row["name"]),
+                department=str(row.get("department") or "Not set"),
+                encoding=np.asarray(encoding, dtype=np.float64),
+            ))
         self._students = students
         if not self._students:
             raise RuntimeError("No registered face encodings were found for this college.")
@@ -163,23 +144,14 @@ class AttendanceRepository:
     def _start_heartbeat(self) -> None:
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             return
-
         self._heartbeat_stop.clear()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
-            name="facetrack-desktop-heartbeat",
-        )
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True, name="facetrack-desktop-heartbeat")
         self._heartbeat_thread.start()
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.is_set():
             try:
-                _request_json(
-                    "post",
-                    "/recognition/desktop-heartbeat",
-                    json={"access_code": self._access_code},
-                )
+                _request_json("post", "/recognition/desktop-heartbeat", json={"access_code": self._access_code})
             except Exception:
                 pass
             self._heartbeat_stop.wait(10)
@@ -199,41 +171,42 @@ class AttendanceRepository:
     def students_with_faces(self) -> list[RegisteredStudent]:
         return list(self._students)
 
-    def _fetch_active_lecture(self, student_id: int) -> None:
+    @staticmethod
+    def _lecture_from_payload(payload: dict) -> ActiveLecture | None:
+        row = payload.get("lecture")
+        if not payload.get("active") or not row:
+            return None
+        return ActiveLecture(
+            id=int(row["id"]),
+            subject=str(row["subject"]),
+            date=str(row["date"]),
+            start_time=str(row["start_time"]),
+            end_time=str(row["end_time"]),
+            class_name=str(row.get("class_name") or ""),
+            section=str(row.get("section") or ""),
+            department=str(row.get("department") or ""),
+        )
+
+    def _fetch_active_lecture(self, student_id: int, timeout: float = 5) -> ActiveLecture | None:
         try:
             payload = _request_json(
                 "get",
                 f"/public/college/access-code/{quote(self._access_code, safe='')}/active-lecture/{student_id}",
+                timeout=timeout,
             )
-            row = payload.get("lecture")
-            lecture = None
-            if payload.get("active") and row:
-                lecture = ActiveLecture(
-                    id=int(row["id"]),
-                    subject=str(row["subject"]),
-                    date=str(row["date"]),
-                    start_time=str(row["start_time"]),
-                    end_time=str(row["end_time"]),
-                    class_name=str(row.get("class_name") or ""),
-                    section=str(row.get("section") or ""),
-                    department=str(row.get("department") or ""),
-                )
+            lecture = self._lecture_from_payload(payload)
             with self._lecture_lock:
                 self._lecture_cache[student_id] = lecture
                 self._lecture_cache_at[student_id] = time.monotonic()
+            return lecture
         except Exception as exc:
             logger.warning("Active lecture lookup failed for student %s: %s", student_id, exc)
+            return None
         finally:
             with self._lecture_lock:
                 self._lecture_refreshing.discard(student_id)
 
     def active_lecture_for_student(self, student_id: int) -> ActiveLecture | None:
-        """Return cached lecture immediately and refresh it in the background.
-
-        The old implementation performed a blocking HTTP request from the
-        Tkinter thread after every successful face match. That made the camera
-        UI pause while FastAPI responded. The cache keeps the UI responsive.
-        """
         now = time.monotonic()
         with self._lecture_lock:
             cached = self._lecture_cache.get(student_id)
@@ -241,11 +214,19 @@ class AttendanceRepository:
             fresh = now - cached_at < self._lecture_cache_ttl
             refreshing = student_id in self._lecture_refreshing
 
-            if not fresh and not refreshing:
-                self._lecture_refreshing.add(student_id)
-                self._lecture_refresh_executor.submit(self._fetch_active_lecture, student_id)
+            if fresh:
+                return cached
+            if refreshing:
+                return cached
+            self._lecture_refreshing.add(student_id)
 
-        return cached
+        # Only the first lookup needs a very short synchronous wait. After that,
+        # all lookups are served from memory while a background refresh runs.
+        lecture = self._fetch_active_lecture(student_id, timeout=0.75)
+        if lecture is not None:
+            return lecture
+        with self._lecture_lock:
+            return self._lecture_cache.get(student_id)
 
     def _submit_attendance(self, student_id: int, lecture_id: int | None) -> None:
         payload = {"student_id": student_id}
@@ -265,12 +246,6 @@ class AttendanceRepository:
                 self._attendance_inflight.discard(key)
 
     def mark_present(self, student_id: int, lecture_id: int | None = None) -> dict:
-        """Queue attendance submission without blocking face recognition.
-
-        A student/lecture pair is submitted at most once every 10 seconds while
-        the same face remains in front of the camera. The backend remains the
-        final authority for duplicate attendance.
-        """
         key = (student_id, lecture_id or 0)
         now = time.monotonic()
         with self._attendance_lock:
@@ -279,6 +254,5 @@ class AttendanceRepository:
                 return {"queued": False, "already_marked": True}
             self._attendance_inflight.add(key)
             self._attendance_last_submit[key] = now
-
         self._attendance_executor.submit(self._submit_attendance, student_id, lecture_id)
         return {"queued": True, "already_marked": False}
