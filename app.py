@@ -61,6 +61,9 @@ class FaceAttendanceApp(tk.Tk):
         self.liveness = LivenessGuard()
 
         self.camera_index = tk.IntVar(value=0)
+        self.camera_choice = tk.StringVar(value="")
+        self.camera_options: list[str] = []
+        self.camera_devices: dict[str, int] = {}
         self.resolution = tk.StringVar(value="480p")
         self.target_fps = tk.StringVar(value="30")
         self.threshold = tk.DoubleVar(value=0.50)
@@ -229,7 +232,6 @@ class FaceAttendanceApp(tk.Tk):
         )
 
     def _build_ui(self) -> None:
-        # Header ------------------------------------------------------------
         header = tk.Frame(self, bg="#0b1321", padx=22, pady=12)
         header.pack(fill="x")
         self._label(header, "FaceTrack", 20, "bold", "#f4f7fb", "#0b1321").pack(side="left")
@@ -248,14 +250,12 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.header_status.pack(side="right")
 
-        # Summary cards ----------------------------------------------------
         stats = tk.Frame(self, bg="#070d18", padx=16, pady=12)
         stats.pack(fill="x")
         self._stat_card(stats, "SCANNER STATUS", "Ready to start", "◉", "scanner_stat")
         self._stat_card(stats, "CURRENT LECTURE", "Waiting for student", "▣", "lecture_stat")
         self._stat_card(stats, "FACE PROFILES READY", str(len(self.students)), "♙", "profiles_stat")
 
-        # Main two-column workspace ---------------------------------------
         content = tk.Frame(self, bg="#070d18", padx=16)
         content.pack(fill="both", expand=True, pady=(0, 12))
         content.grid_columnconfigure(0, weight=1, minsize=650)
@@ -300,6 +300,25 @@ class FaceAttendanceApp(tk.Tk):
 
         control = tk.Frame(left, bg="#172234")
         control.pack(fill="x")
+        self._label(control, "CAMERA", 8, "bold", "#7589a5").pack(side="left")
+        self.camera_combo = ttk.Combobox(
+            control,
+            textvariable=self.camera_choice,
+            values=(),
+            width=24,
+            state="readonly",
+            style="Dark.TCombobox",
+        )
+        self.camera_combo.pack(side="left", padx=(7, 8))
+        self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_selected)
+        self.refresh_camera_button = ttk.Button(
+            control,
+            text="Refresh",
+            style="Secondary.TButton",
+            command=self._refresh_cameras,
+        )
+        self.refresh_camera_button.pack(side="left", padx=(0, 14))
+
         self._label(control, "QUALITY", 8, "bold", "#7589a5").pack(side="left")
         ttk.Combobox(
             control,
@@ -320,7 +339,6 @@ class FaceAttendanceApp(tk.Tk):
         ).pack(side="left", padx=(7, 0))
         ttk.Button(control, text="Stop", style="Secondary.TButton", command=self.stop).pack(side="right")
 
-        # Right verification panel ----------------------------------------
         right = self._card(content, bg="#172234", padx=14, pady=14)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
@@ -373,7 +391,6 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.sound_label.pack(anchor="w")
 
-        # Footer -----------------------------------------------------------
         footer = tk.Frame(self, bg="#0b1321", padx=16, pady=8)
         footer.pack(fill="x")
         tk.Label(
@@ -384,6 +401,50 @@ class FaceAttendanceApp(tk.Tk):
             fg="#91a1b8",
             font=("Segoe UI", 9),
         ).pack(fill="x")
+
+        self._refresh_cameras()
+
+    def _refresh_cameras(self) -> None:
+        if getattr(self, "running", False):
+            self.status.set("Stop the camera before refreshing the camera list.")
+            return
+        previous_index = self.camera_index.get()
+        devices: dict[str, int] = {}
+        for index in range(8):
+            capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            try:
+                if capture.isOpened():
+                    ok, _frame = capture.read()
+                    if ok:
+                        devices[f"Camera {index}"] = index
+            finally:
+                capture.release()
+
+        self.camera_devices = devices
+        self.camera_options = list(devices)
+        self.camera_combo.configure(values=self.camera_options)
+
+        if not self.camera_options:
+            self.camera_choice.set("No camera detected")
+            self.camera_index.set(0)
+            self.status.set("No camera detected. Connect a webcam and click Refresh.")
+            return
+
+        selected = next(
+            (name for name, index in devices.items() if index == previous_index),
+            self.camera_options[0],
+        )
+        self.camera_choice.set(selected)
+        self.camera_index.set(devices[selected])
+        self.status.set(f"{len(self.camera_options)} camera(s) available. Select one and start the scanner.")
+
+    def _on_camera_selected(self, _event=None) -> None:
+        selected = self.camera_choice.get()
+        index = self.camera_devices.get(selected)
+        if index is None:
+            return
+        self.camera_index.set(index)
+        self.status.set(f"Selected {selected}. Ready to start the scanner.")
 
     def _stat_card(self, parent, title, value, icon, attr) -> None:
         card = tk.Frame(
@@ -452,14 +513,18 @@ class FaceAttendanceApp(tk.Tk):
         try:
             self._load_college_data()
             self._apply_recognition_settings(self.settings)
-            self.camera = cv2.VideoCapture(self.camera_index.get(), cv2.CAP_DSHOW)
+            selected_index = self.camera_index.get()
+            if self.camera_choice.get() in self.camera_devices:
+                selected_index = self.camera_devices[self.camera_choice.get()]
+            self.camera_index.set(selected_index)
+            self.camera = cv2.VideoCapture(selected_index, cv2.CAP_DSHOW)
             width, height = RESOLUTIONS[self.resolution.get()]
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.camera.set(cv2.CAP_PROP_FPS, int(self.target_fps.get()))
             self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not self.camera.isOpened():
-                raise RuntimeError("Camera could not be opened. Check the selected camera number.")
+                raise RuntimeError("Selected camera could not be opened. Click Refresh and choose another camera.")
 
             self.running = True
             self.scan_token += 1
@@ -473,7 +538,7 @@ class FaceAttendanceApp(tk.Tk):
             self.liveness_status.set("Live face check + blink required")
             self.person.set("Face not verified")
             self.header_status.configure(text="● Scanner active", fg="#22c995")
-            self.scanner_stat.configure(text="Active scanning")
+            self.scanner_stat.configure(text="FaceTrack scanning")
             self.start_button.configure(text="▣  Camera Active")
 
             self.capture_thread = Thread(
@@ -482,7 +547,7 @@ class FaceAttendanceApp(tk.Tk):
                 daemon=True,
             )
             self.capture_thread.start()
-            self.status.set("Scanning. Keep exactly one face inside the guide and blink once.")
+            self.status.set(f"Scanning with Camera {selected_index}. Keep exactly one face inside the guide and blink once.")
             self._next_frame()
         except Exception as error:
             self.stop()
@@ -541,9 +606,6 @@ class FaceAttendanceApp(tk.Tk):
         self._collect_recognition()
         self._draw_latest_recognition(frame)
 
-        # Fit the camera feed to the actual widget instead of using a fixed
-        # 900x600 canvas. This keeps the preview balanced at 720p/1080p and
-        # prevents a large empty/black area on wide desktop windows.
         label_width = max(self.video_label.winfo_width() - 8, 320)
         label_height = max(self.video_label.winfo_height() - 8, 240)
         height, width = frame.shape[:2]
