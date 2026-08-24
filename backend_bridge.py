@@ -58,7 +58,7 @@ def _api_url(path: str) -> str:
 
 def _request_json(method: str, path: str, **kwargs) -> dict:
     url = _api_url(path)
-    timeout = kwargs.pop("timeout", 5)
+    timeout = kwargs.pop("timeout", 3)
     logger.info("Backend request: %s %s", method.upper(), url)
     try:
         response = requests.request(method, url, timeout=timeout, **kwargs)
@@ -108,7 +108,7 @@ class AttendanceRepository:
         self._lecture_cache_at: dict[int, float] = {}
         self._lecture_refreshing: set[int] = set()
         self._lecture_lock = threading.Lock()
-        self._lecture_cache_ttl = 3.0
+        self._lecture_cache_ttl = 10.0
         self._lecture_refresh_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lecture-api")
         self._resolve_college()
         self._start_heartbeat()
@@ -151,10 +151,10 @@ class AttendanceRepository:
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.is_set():
             try:
-                _request_json("post", "/recognition/desktop-heartbeat", json={"access_code": self._access_code})
+                _request_json("post", "/recognition/desktop-heartbeat", json={"access_code": self._access_code}, timeout=2)
             except Exception:
                 pass
-            self._heartbeat_stop.wait(10)
+            self._heartbeat_stop.wait(15)
 
     def stop_heartbeat(self) -> None:
         self._heartbeat_stop.set()
@@ -187,7 +187,7 @@ class AttendanceRepository:
             department=str(row.get("department") or ""),
         )
 
-    def _fetch_active_lecture(self, student_id: int, timeout: float = 5) -> ActiveLecture | None:
+    def _fetch_active_lecture(self, student_id: int, timeout: float = 1.0) -> ActiveLecture | None:
         try:
             payload = _request_json(
                 "get",
@@ -206,27 +206,33 @@ class AttendanceRepository:
             with self._lecture_lock:
                 self._lecture_refreshing.discard(student_id)
 
+    def _refresh_lecture_background(self, student_id: int) -> None:
+        with self._lecture_lock:
+            if student_id in self._lecture_refreshing:
+                return
+            self._lecture_refreshing.add(student_id)
+        try:
+            self._lecture_refresh_executor.submit(self._fetch_active_lecture, student_id, 2.0)
+        except RuntimeError:
+            with self._lecture_lock:
+                self._lecture_refreshing.discard(student_id)
+
     def active_lecture_for_student(self, student_id: int) -> ActiveLecture | None:
+        """Return cached lecture immediately and refresh it in the background.
+
+        This method is called from the Tkinter UI thread. It must never wait on
+        the FastAPI server during normal recognition, otherwise a slow backend
+        response makes the camera appear to freeze.
+        """
         now = time.monotonic()
         with self._lecture_lock:
             cached = self._lecture_cache.get(student_id)
             cached_at = self._lecture_cache_at.get(student_id, 0.0)
-            fresh = now - cached_at < self._lecture_cache_ttl
-            refreshing = student_id in self._lecture_refreshing
+            fresh = cached_at > 0 and now - cached_at < self._lecture_cache_ttl
 
-            if fresh:
-                return cached
-            if refreshing:
-                return cached
-            self._lecture_refreshing.add(student_id)
-
-        # Only the first lookup needs a very short synchronous wait. After that,
-        # all lookups are served from memory while a background refresh runs.
-        lecture = self._fetch_active_lecture(student_id, timeout=0.75)
-        if lecture is not None:
-            return lecture
-        with self._lecture_lock:
-            return self._lecture_cache.get(student_id)
+        if not fresh:
+            self._refresh_lecture_background(student_id)
+        return cached
 
     def _submit_attendance(self, student_id: int, lecture_id: int | None) -> None:
         payload = {"student_id": student_id}
@@ -237,6 +243,7 @@ class AttendanceRepository:
                 "post",
                 f"/public/college/{quote(self._college_slug, safe='')}/mark-attendance",
                 json=payload,
+                timeout=3,
             )
         except Exception as exc:
             logger.warning("Attendance submission failed for student %s: %s", student_id, exc)
@@ -246,6 +253,7 @@ class AttendanceRepository:
                 self._attendance_inflight.discard(key)
 
     def mark_present(self, student_id: int, lecture_id: int | None = None) -> dict:
+        """Queue attendance without blocking the camera/UI thread."""
         key = (student_id, lecture_id or 0)
         now = time.monotonic()
         with self._attendance_lock:
