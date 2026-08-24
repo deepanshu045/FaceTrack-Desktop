@@ -80,7 +80,7 @@ class FaceAttendanceApp(tk.Tk):
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("Dark.TCombobox", foreground="#e6edf7", fieldbackground="#0e1727", background="#0e1727", bordercolor="#2a3950", lightcolor="#0e1727", darkcolor="#0e1727", selectforeground="#ffffff", selectbackground="#2455a6", arrowcolor="#9fb1c8")
+        style.configure("Dark.TCombobox", foreground="#010101", fieldbackground="#0e1727", background="#0e1727", bordercolor="#2a3950", lightcolor="#0e1727", darkcolor="#0e1727", selectforeground="#ffffff", selectbackground="#2455a6", arrowcolor="#9fb1c8")
         style.configure("Blue.TButton", foreground="#ffffff", background="#2457c5", borderwidth=0, padding=(15, 9), font=("Segoe UI", 10, "bold"))
         style.map("Blue.TButton", background=[("active", "#2e6ce6"), ("disabled", "#233a68")])
         style.configure("Secondary.TButton", foreground="#dbe7f5", background="#263449", borderwidth=0, padding=(13, 9), font=("Segoe UI", 10, "bold"))
