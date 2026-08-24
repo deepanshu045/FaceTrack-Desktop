@@ -255,7 +255,7 @@ class FaceAttendanceApp(tk.Tk):
         footer = tk.Frame(self, bg="#0b1321", padx=18, pady=8)
         footer.pack(fill="x")
         self._label(footer, "STATUS", 8, "bold", "#7589a5", "#0b1321").pack(side="left", padx=(0, 10))
-        self._label(footer, textvariable=self.status, 9, fg="#b9c7d9", bg="#0b1321", anchor="w").pack(side="left", fill="x", expand=True)
+        self._label(footer, 9, textvariable=self.status, fg="#b9c7d9", bg="#0b1321", anchor="w").pack(side="left", fill="x", expand=True)
 
     def _stat_card(self, parent, title: str, value: str, icon: str, attr: str) -> None:
         card = tk.Frame(parent, bg="#172234", padx=14, pady=10, highlightbackground="#27364c", highlightthickness=1)
