@@ -32,12 +32,14 @@ class LivenessResult:
 class LivenessGuard:
     """Stateful AI anti-spoof + active blink challenge with low CPU overhead."""
 
-    def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 1.5) -> None:
+    def __init__(self, challenge_timeout: float = 12.0, spoof_refresh: float = 2.0, blink_refresh: float = 0.35) -> None:
         self.challenge_timeout = challenge_timeout
         self.spoof_refresh = spoof_refresh
+        self.blink_refresh = blink_refresh
         self.challenge_started = time.monotonic()
         self.blink_count = 0
         self._eye_was_closed = False
+        self._last_blink_check = 0.0
         self._last_ai_check = 0.0
         self._last_ai_real = False
         self._last_ai_score: float | None = None
@@ -54,6 +56,7 @@ class LivenessGuard:
         self.challenge_started = time.monotonic()
         self.blink_count = 0
         self._eye_was_closed = False
+        self._last_blink_check = 0.0
         self._last_ai_check = 0.0
         self._last_ai_real = False
         self._last_ai_score = None
@@ -175,8 +178,6 @@ class LivenessGuard:
             src_h, src_w = frame.shape[:2]
             box_w = max(1, right - left)
             box_h = max(1, bottom - top)
-            # Match the upstream MiniFASNetV2 inference exactly: scale is capped
-            # by the available image area, then resize to the model input.
             scale = min((src_h - 1) / box_h, (src_w - 1) / box_w, 2.7)
             new_w = box_w * scale
             new_h = box_h * scale
@@ -194,7 +195,6 @@ class LivenessGuard:
             input_cfg = self._session.get_inputs()[0]
             input_size = tuple(input_cfg.shape[2:])
             face = cv2.resize(cropped, input_size[::-1], interpolation=cv2.INTER_LINEAR)
-            # The upstream model expects raw BGR float32 values, NOT /255 normalization.
             tensor = np.transpose(face.astype(np.float32), (2, 0, 1))[None, ...]
             logits = np.asarray(self._session.run([self._output_name], {self._input_name: tensor})[0], dtype=np.float32)
             logits -= np.max(logits, axis=1, keepdims=True)
@@ -215,6 +215,10 @@ class LivenessGuard:
             self._ai_error = str(error)
 
     def _update_blink(self, frame: np.ndarray, location: tuple[int, int, int, int]) -> None:
+        now = time.monotonic()
+        if now - self._last_blink_check < self.blink_refresh:
+            return
+        self._last_blink_check = now
         scale = 0.5
         small = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         small_location = tuple(int(value * scale) for value in location)
