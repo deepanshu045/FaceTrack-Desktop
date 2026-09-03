@@ -15,7 +15,7 @@ import requests
 
 
 logger = logging.getLogger(__name__)
-DEFAULT_BACKEND_URL = os.getenv("FACE_ATTENDANCE_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_BACKEND_URL = "https://facetrack-ggbe.onrender.com"
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ def _api_url(path: str) -> str:
 
 def _request_json(method: str, path: str, **kwargs) -> dict:
     url = _api_url(path)
-    timeout = kwargs.pop("timeout", 3)
+    timeout = kwargs.pop("timeout", 30)
     logger.info("Backend request: %s %s", method.upper(), url)
     try:
         response = requests.request(method, url, timeout=timeout, **kwargs)
