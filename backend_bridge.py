@@ -151,7 +151,7 @@ class AttendanceRepository:
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.is_set():
             try:
-                _request_json("post", "/recognition/desktop-heartbeat", json={"access_code": self._access_code}, timeout=2)
+                _request_json("post", "/recognition/desktop-heartbeat", json={"access_code": self._access_code}, timeout=10)
             except Exception:
                 pass
             self._heartbeat_stop.wait(15)
@@ -212,7 +212,7 @@ class AttendanceRepository:
                 return
             self._lecture_refreshing.add(student_id)
         try:
-            self._lecture_refresh_executor.submit(self._fetch_active_lecture, student_id, 2.0)
+            self._lecture_refresh_executor.submit(self._fetch_active_lecture, student_id, 10.0)
         except RuntimeError:
             with self._lecture_lock:
                 self._lecture_refreshing.discard(student_id)
@@ -243,7 +243,7 @@ class AttendanceRepository:
                 "post",
                 f"/public/college/{quote(self._college_slug, safe='')}/mark-attendance",
                 json=payload,
-                timeout=3,
+                timeout=10,
             )
         except Exception as exc:
             logger.warning("Attendance submission failed for student %s: %s", student_id, exc)
