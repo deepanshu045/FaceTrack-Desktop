@@ -104,6 +104,10 @@ class AttendanceRepository:
         self._attendance_lock = threading.Lock()
         self._attendance_inflight: set[tuple[int, int]] = set()
         self._attendance_last_submit: dict[tuple[int, int], float] = {}
+        # Session-local attendance cache. A (student, lecture) pair is cached
+        # after a successful submission, so repeated recognition frames do not
+        # keep calling the attendance endpoint for the same lecture.
+        self._attendance_cache: set[tuple[int, int]] = set()
         self._lecture_cache: dict[int, ActiveLecture | None] = {}
         self._lecture_cache_at: dict[int, float] = {}
         self._lecture_refreshing: set[int] = set()
@@ -235,32 +239,49 @@ class AttendanceRepository:
         return cached
 
     def _submit_attendance(self, student_id: int, lecture_id: int | None) -> None:
-        payload = {"student_id": student_id}
-        if lecture_id is not None:
-            payload["lecture_id"] = lecture_id
+        key = (student_id, lecture_id or 0)
         try:
+            payload = {"student_id": student_id}
+            if lecture_id is not None:
+                payload["lecture_id"] = lecture_id
             _request_json(
                 "post",
                 f"/public/college/{quote(self._college_slug, safe='')}/mark-attendance",
                 json=payload,
                 timeout=10,
             )
+            # Any successful 2xx response means the server accepted the request.
+            # Whether it created a new row or reported an existing row, this
+            # scanner does not need to submit the same student/lecture pair again.
+            with self._attendance_lock:
+                self._attendance_cache.add(key)
         except Exception as exc:
             logger.warning("Attendance submission failed for student %s: %s", student_id, exc)
         finally:
-            key = (student_id, lecture_id or 0)
             with self._attendance_lock:
                 self._attendance_inflight.discard(key)
 
     def mark_present(self, student_id: int, lecture_id: int | None = None) -> dict:
-        """Queue attendance without blocking the camera/UI thread."""
+        """Queue attendance without blocking the camera/UI thread.
+
+        Attendance is cached by (student_id, lecture_id) for the lifetime of
+        this repository/session. Recognition can therefore continue every 0.5s
+        without repeatedly submitting the same attendance event.
+        """
         key = (student_id, lecture_id or 0)
         now = time.monotonic()
         with self._attendance_lock:
+            if key in self._attendance_cache:
+                return {"queued": False, "already_marked": True, "cached": True}
             last_submit = self._attendance_last_submit.get(key, 0.0)
             if key in self._attendance_inflight or now - last_submit < 10.0:
-                return {"queued": False, "already_marked": True}
+                return {"queued": False, "already_marked": True, "cached": False}
             self._attendance_inflight.add(key)
             self._attendance_last_submit[key] = now
-        self._attendance_executor.submit(self._submit_attendance, student_id, lecture_id)
-        return {"queued": True, "already_marked": False}
+        try:
+            self._attendance_executor.submit(self._submit_attendance, student_id, lecture_id)
+        except RuntimeError:
+            with self._attendance_lock:
+                self._attendance_inflight.discard(key)
+            raise
+        return {"queued": True, "already_marked": False, "cached": False}
