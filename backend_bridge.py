@@ -244,17 +244,17 @@ class AttendanceRepository:
             payload = {"student_id": student_id}
             if lecture_id is not None:
                 payload["lecture_id"] = lecture_id
-            response = _request_json(
+            _request_json(
                 "post",
                 f"/public/college/{quote(self._college_slug, safe='')}/mark-attendance",
                 json=payload,
                 timeout=3,
             )
-            # The server may report that attendance was already present. That
-            # is also a terminal state for this scanner session.
-            if response.get("already_marked") or response.get("success") or response.get("marked"):
-                with self._attendance_lock:
-                    self._attendance_cache.add(key)
+            # Any successful 2xx response means the server accepted the request.
+            # Whether it created a new row or reported an existing row, this
+            # scanner does not need to submit the same student/lecture pair again.
+            with self._attendance_lock:
+                self._attendance_cache.add(key)
         except Exception as exc:
             logger.warning("Attendance submission failed for student %s: %s", student_id, exc)
         finally:
